@@ -111,39 +111,46 @@ def build_plist(
     label: str = paths.UI_AGENT_LABEL,
     app: Path = INSTALLED_APP,
     *,
+    args: tuple[str, ...] = (),
+    log_prefix: str = "ui",
     log_dir: Path | None = None,
 ) -> dict[str, object]:
     """The LaunchAgent definition, as a plain dict `plistlib` can dump.
 
-    Separated from writing it so the *contents* are testable without
-    touching `~/Library/LaunchAgents/` — every assertion about
-    `KeepAlive`, `RunAtLoad`, and the argv shape runs against this.
+    Serves both agents the app installs: the menu bar (no `args`) and the
+    display (`args=("--display",)`). The two differ only in the argv and
+    the log filenames; everything else — `KeepAlive{SuccessfulExit:
+    false}`, `RunAtLoad`, `ProcessType Interactive` — is identical and is
+    correct for both. `ProcessType Interactive` matters especially for the
+    display: it is what puts the job in a session with a window-server
+    connection, without which the display cannot draw at all.
 
-    No `WorkingDirectory`: unlike the source-run display agent, nothing
-    in the bundle resolves anything relative to cwd. Every path the app
-    uses now comes from `paths.py`, which is anchored to `Path.home()`
-    and `sys.executable`.
+    Separated from writing it so the *contents* are testable without
+    touching `~/Library/LaunchAgents/`.
+
+    No `WorkingDirectory`: nothing in the bundle resolves anything
+    relative to cwd. Every path the app uses comes from `paths.py`, which
+    is anchored to `Path.home()` and `sys.executable`.
     """
     validate_label(label)
     logs = paths.log_dir() if log_dir is None else log_dir
     return {
         "Label": label,
-        # No arguments: the no-arg path *is* the menu bar. `open -a` is
+        # The bundle's single executable, dispatched by argv: no args is
+        # the menu bar, `--display` is the display agent. `open -a` is
         # ruled out — it returns immediately and launchd would see a job
         # that instantly exits.
-        "ProgramArguments": [str(executable_path(app))],
+        "ProgramArguments": [str(executable_path(app)), *args],
         "RunAtLoad": True,
-        # See the module docstring: `true` here would defeat the Quit
-        # item, `false` would leave a crashed menu bar gone until login.
+        # `true` would defeat the Quit item (menu bar) / would respawn a
+        # deliberately-stopped display; `false` leaves a *crash* gone
+        # until login. `{SuccessfulExit: false}` gives both the clean
+        # behaviours. This is why the Quit item, which boots the display
+        # out with a clean exit, actually stays stopped.
         "KeepAlive": {"SuccessfulExit": False},
         "ThrottleInterval": THROTTLE_INTERVAL_S,
-        # Same directory the display agent's logs will move to, and the
-        # one root a user is ever asked to open by name.
-        "StandardOutPath": str(logs / "ui.stdout.log"),
-        "StandardErrorPath": str(logs / "ui.stderr.log"),
-        # LSUIElement in Info.plist keeps the Dock icon away; this keeps
-        # launchd from putting the job in a session that has no window
-        # server connection at all.
+        "StandardOutPath": str(logs / f"{log_prefix}.stdout.log"),
+        "StandardErrorPath": str(logs / f"{log_prefix}.stderr.log"),
         "ProcessType": "Interactive",
     }
 
@@ -280,7 +287,11 @@ def set_enabled(label: str, enabled: bool) -> bool:
 
 
 def install(
-    label: str = paths.UI_AGENT_LABEL, app: Path = INSTALLED_APP
+    label: str = paths.UI_AGENT_LABEL,
+    app: Path = INSTALLED_APP,
+    *,
+    args: tuple[str, ...] = (),
+    log_prefix: str = "ui",
 ) -> bool:
     """Write the plist and (re)load it. Safe to run repeatedly.
 
@@ -303,12 +314,30 @@ def install(
     path = plist_path(label)
     if not bootout(label):
         return False
-    if not write_plist(path, build_plist(label, app)):
+    if not write_plist(path, build_plist(label, app, args=args, log_prefix=log_prefix)):
         return False
     if not bootstrap(label, path):
         return False
-    print(f"ui_agent.py: installed {label} -> {executable}")
+    print(f"ui_agent.py: installed {label} -> {executable} {' '.join(args)}".rstrip())
     return True
+
+
+def install_display(app: Path = INSTALLED_APP) -> bool:
+    """Install and start the **display** agent — the process that draws
+    pictures on the View. `--display` selects it out of the bundle's
+    single executable.
+
+    This is the piece a fresh install needs and v1.0.0 shipped without:
+    nothing generated a display-agent plist, so `startDisplay_` and
+    first-run both dead-ended at "No display agent installed" on any
+    machine where one had not been placed by hand.
+    """
+    return install(
+        paths.DISPLAY_AGENT_LABEL,
+        app,
+        args=("--display",),
+        log_prefix="display",
+    )
 
 
 def uninstall(label: str = paths.UI_AGENT_LABEL) -> bool:

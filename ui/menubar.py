@@ -49,6 +49,7 @@ from display import control, paths, single_instance
 from display.config_store import read_json_object
 from ui import first_run_state as fr
 from ui import menubar_state as ms
+from ui import ui_agent
 
 #: How often the UI re-reads `status.json`. Fast enough that the
 #: transient label (a ~3s hold) cannot be missed entirely and that
@@ -551,6 +552,13 @@ class MenuBarController(AppKit.NSObject):
     @objc.python_method
     def _first_run_closed(self) -> None:
         self._first_run = None
+        # Finishing setup should make pictures appear, not leave the user
+        # at "Not showing pictures" wondering what setup accomplished.
+        # first-run has just persisted the source and calibration; this
+        # installs (if needed) and starts the display agent that draws
+        # them. startDisplay_ is self-installing and idempotent, so this
+        # is safe whether or not an agent already exists.
+        self.startDisplay_(None)
 
     def calibrate_(self, sender) -> None:
         """Calibration window. One at a time (see `_apply_menu`).
@@ -605,14 +613,27 @@ class MenuBarController(AppKit.NSObject):
         """
         try:
             plist = agent_plist_path()
-            if not plist.exists():
-                self._alert(
-                    "No display agent is installed.",
-                    "Nothing is set up to show pictures on the View yet.",
-                )
-                return
             domain = f"gui/{os.getuid()}"
             label = f"{domain}/{DISPLAY_AGENT_LABEL}"
+            # Self-installing. If the display agent has never been set up
+            # — which on a fresh install is *always*, since nothing else
+            # creates it — generate its plist pointing at this bundle
+            # (`ImageView --display`) and bootstrap it. install_display
+            # boots out, writes, and bootstraps, so it also cleanly
+            # restarts an already-installed-but-stopped agent, which is
+            # the other case this action exists for. v1.0.0 shipped
+            # without this and dead-ended here with "No display agent
+            # installed" on every machine but the one it was built on.
+            if not plist.exists():
+                if ui_agent.install_display():
+                    return
+                self._alert(
+                    "Couldn't start showing pictures.",
+                    "The display agent could not be installed. If ImageView "
+                    "is not in your Applications folder, move it there and "
+                    "try again.",
+                )
+                return
             if self._launchctl(["kickstart", "-k", label]):
                 return
             if self._launchctl(["bootstrap", domain, str(plist)]):

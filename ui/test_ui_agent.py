@@ -88,6 +88,54 @@ class BuildPlistTests(unittest.TestCase):
         the display agent instead, on a label that says `.ui`."""
         self.assertEqual(len(self.data["ProgramArguments"]), 1)
 
+
+class DisplayPlistTests(unittest.TestCase):
+    """The display-agent plist — the piece v1.0.0 shipped without, so a
+    fresh install had no way to draw pictures at all."""
+
+    def setUp(self) -> None:
+        self.app = Path("/Applications/ImageView.app")
+        self.data = ui_agent.build_plist(
+            paths.DISPLAY_AGENT_LABEL, self.app, args=("--display",), log_prefix="display"
+        )
+
+    def test_label_is_the_display_agent(self) -> None:
+        self.assertEqual(self.data["Label"], paths.DISPLAY_AGENT_LABEL)
+
+    def test_argv_passes_the_display_flag_to_the_bundle_executable(self) -> None:
+        self.assertEqual(
+            self.data["ProgramArguments"],
+            ["/Applications/ImageView.app/Contents/MacOS/ImageView", "--display"],
+        )
+
+    def test_logs_are_the_display_files_not_the_ui_files(self) -> None:
+        self.assertTrue(self.data["StandardErrorPath"].endswith("display.stderr.log"))
+        self.assertTrue(self.data["StandardOutPath"].endswith("display.stdout.log"))
+
+    def test_process_type_is_interactive_for_window_server_access(self) -> None:
+        """Without a session that has a window-server connection the
+        display cannot draw — this is what grants it one."""
+        self.assertEqual(self.data["ProcessType"], "Interactive")
+
+    def test_keepalive_lets_the_quit_item_actually_stop_it(self) -> None:
+        self.assertEqual(self.data["KeepAlive"], {"SuccessfulExit": False})
+
+    def test_install_display_targets_the_display_label_with_the_flag(self) -> None:
+        """install_display must not silently install a menu-bar plist under
+        the display label — the mistake that would reproduce the bug in a
+        subtler form."""
+        captured = {}
+
+        def fake_install(label, app, *, args=(), log_prefix="ui"):
+            captured.update(label=label, args=args, log_prefix=log_prefix)
+            return True
+
+        with mock.patch.object(ui_agent, "install", fake_install):
+            self.assertTrue(ui_agent.install_display(Path("/Applications/ImageView.app")))
+        self.assertEqual(captured["label"], paths.DISPLAY_AGENT_LABEL)
+        self.assertEqual(captured["args"], ("--display",))
+        self.assertEqual(captured["log_prefix"], "display")
+
     def test_open_dash_a_is_not_used(self) -> None:
         """The packaging rules it out: it returns immediately, so launchd sees a
         job that instantly exits."""
