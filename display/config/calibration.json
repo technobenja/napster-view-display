@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "framebuffer": { "width": 960, "height": 960 },
+  "target_screen": { "resolve_strategy": "match_by_resolution_excluding_main" },
+  "circle": {
+    "center_x": 483.0,
+    "center_y": 482.0,
+    "radius_px": 472.0
+  },
+  "safety_margin_pct": 0.93
+}

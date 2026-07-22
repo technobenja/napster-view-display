@@ -1,0 +1,6 @@
+{
+  "rotation_interval_s": 900,
+  "poll_interval_s": 1800,
+  "fade_duration_s": 2.0,
+  "cache_max": 300
+}

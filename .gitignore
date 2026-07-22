@@ -1,0 +1,27 @@
+
+__pycache__/
+.claude/
+.DS_Store
+.venv-build/
+*.pyc
+# Claude Code agent-memory scratch state — tooling-internal, not project docs
+# display/ (Phase 2 — see docs/plans/phase-2-2d-dashboard.md §7 file layout)
+# py2app build venv (packaging/README: recreate with pip install py2app
+# pyobjc umbrella, which modulegraph would drag into the bundle.
+# pyobjc-core pyobjc-framework-Cocoa httpx). Deliberately not the full
+build/
+display/.venv
+display/.venv/
+display/cache/
+display/logs/
+display/state/
+dist/
+findings/**/*.heic
+findings/**/*.jpeg
+findings/**/*.jpg
+findings/**/*.JPG
+findings/**/*.png
+findings/**/app-tree.txt
+findings/**/ioreg-*.txt
+findings/**/usb.json
+findings/**/usb.txt
