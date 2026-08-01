@@ -78,6 +78,17 @@ class NoHardcodedDefaultsTests(unittest.TestCase):
         The patterns come from `release_gate.HARD_TERMS` rather than being
         listed here, so this test and the release gate cannot drift apart
         — and so the identity strings themselves live in exactly one file.
+
+        **That file is deliberately not published.** It is the catalogue of
+        strings that must never appear in a public build, so shipping it
+        would defeat its own purpose — and the consequence is that this
+        assertion cannot run where it is published. It skips there instead
+        of erroring, because the README tells every user to run this suite
+        and a hard failure on a fresh clone is the first thing they see.
+
+        Where it *does* run — the maintainer's tree, which is the only
+        place the term list exists and the only place a leak could be
+        introduced — it runs for real.
         """
         import inspect
         import re
@@ -85,7 +96,14 @@ class NoHardcodedDefaultsTests(unittest.TestCase):
         from pathlib import Path
 
         sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-        import release_gate
+        try:
+            import release_gate
+        except ModuleNotFoundError:
+            self.skipTest(
+                "release_gate is maintainer-only tooling and is deliberately "
+                "off the public manifest; this assertion runs where the term "
+                "list lives"
+            )
 
         from display import image_pool
         from display.sources import image_server
