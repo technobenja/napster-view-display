@@ -54,7 +54,7 @@ shasum -a 256 ~/Downloads/ImageView.dmg
 ```
 
 ```
-SHA-256 (ImageView.dmg) = 91d6b14bc8ebfe11734961190dc4baf2f59de3d956ff3073be7d6ef7f6d09c1b
+SHA-256 (ImageView.dmg) = 490d68f0e7a215c72af239cd464c48ecf13458b45a5cf2af395e86c983afd847
 ```
 
 If that does not match, do not open it.
@@ -81,6 +81,40 @@ with the physical bezel. The result is stored in `~/.viewlab/calibration.json`.
 
 The shipped defaults were measured on one unit; yours may differ slightly.
 
+### When something is wrong, the View says so
+
+A wall display has no console and nobody standing in front of it, so a blank
+circle and a broken one look identical. Rather than holding the last good
+picture indefinitely, the View shows a readable message and distinguishes the
+cases that have different fixes:
+
+| On screen | What it means |
+|---|---|
+| **Can't reach the server** | the machine serving pictures is off, or this Mac is off the network |
+| **Not authorised** | the server rejected the access token below |
+| **No pictures** (token in use) | the server answered but sent nothing — either the token was rejected or there is genuinely nothing to show, and the server cannot tell you which |
+| **No pictures yet** | reachable, nothing matched — add some pictures |
+
+A transient network blip does not take the screen: a fault has to persist for
+two polls first, unless there is nothing being displayed anyway. A rejected
+credential is shown immediately, because it will not fix itself.
+
+### HTTP sources that need a token
+
+An HTTP image source may require an `X-OpenLab-Read` header on its listing
+call. If one is present in your login keychain, ImageView sends it:
+
+```bash
+security add-generic-password -a openlab-read -s viewlab-openlab-read -U -w
+```
+
+It is sent **only on the listing request**, never when fetching image data,
+and **only to a private (LAN or loopback) address** — never to a public host.
+With no such keychain item, requests are anonymous and nothing changes.
+
+> `security ... -w` prompts for the value twice. Feeding it a single line
+> stores an empty secret and still exits 0, so read it back to confirm.
+
 ## The research
 
 The most useful part of this repository for anyone else working on this
@@ -105,10 +139,17 @@ packaging/make_release.sh
 ```
 
 This builds `ImageView.app` and `ImageView.dmg` from a clean, tracked-files-only
-checkout at a neutral path. It refuses to produce a `.dmg` if any of its five
-gates fail — including an identity sweep over the finished bundle that reads
-inside binary `.pyc` files and compressed zip members, where an ordinary
-`grep -r` sees nothing.
+checkout at a neutral path. It refuses to produce a `.dmg` if any of its six
+gates fail — including identity sweeps over both the finished bundle *and* the
+`.dmg` itself, which read inside binary `.pyc` files, compressed zip members
+and the mounted disk image, where an ordinary `grep -r` sees nothing.
+
+**Two of those gates need maintainer-only tooling that is deliberately not
+published.** The sweeps are driven by a `release_gate.py` that holds the
+catalogue of strings which must never appear in a public build — publishing
+that catalogue would defeat its own purpose. Building from this repository
+therefore stops at the first sweep. The `.app` and `.dmg` steps themselves are
+ordinary py2app and `hdiutil` and are readable in the script.
 
 ## Running the tests
 
@@ -133,7 +174,6 @@ There are no third-party test dependencies.
 | `packaging/` | py2app build, icons, `make_release.sh` |
 | `probe/` | Read-only diagnostic script and the decision record |
 | `findings/` | Research notes |
-| `release_gate.py` | The published-content checks, run by the test suite |
 
 ## License
 

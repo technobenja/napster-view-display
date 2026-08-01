@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import logging
 
-from display import source_settings
+from display import read_token, source_settings
 from display.source_settings import SourceSettings
 from display.sources.base import ImageSource
 from display.sources.folder import FolderSource
@@ -27,7 +27,15 @@ def build_source(settings: SourceSettings) -> ImageSource:
     if settings.kind == source_settings.KIND_JSON_URL:
         return JsonUrlSource(list_url=settings.list_url)
     if settings.kind == source_settings.KIND_IMAGE_SERVER:
-        return ImageServerSource(base_url=settings.base_url, pool=settings.pool)
+        # The keychain lookup happens here rather than inside
+        # ImageServerSource so the adapter stays injectable (and testable)
+        # without a keychain. Absent item -> None -> anonymous, which is
+        # the correct behaviour for a server that needs no credential.
+        return ImageServerSource(
+            base_url=settings.base_url,
+            pool=settings.pool,
+            read_token=read_token.load_read_token(),
+        )
     if settings.kind != source_settings.KIND_FOLDER:
         logger.warning(
             "sources: unknown source kind %r; falling back to a folder source.",

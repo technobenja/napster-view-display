@@ -44,6 +44,34 @@ EMPTY_FILL_COLOR = AppKit.NSColor.colorWithSRGBRed_green_blue_alpha_(
     0.16, 0.16, 0.16, 1.0
 )
 
+# Notice backdrops, one per `notice.SEVERITY_*`. Deliberately dark and
+# desaturated rather than a full-bleed warning colour: this thing sits on
+# a wall in a living space, and a glowing red disc at 2am is how a useful
+# alert becomes an unplugged display. They are still unmistakably *not*
+# charcoal, which is the only distinction that has to survive a glance
+# from across the room.
+NOTICE_FILL_COLORS = {
+    "error": AppKit.NSColor.colorWithSRGBRed_green_blue_alpha_(0.28, 0.06, 0.06, 1.0),
+    "warning": AppKit.NSColor.colorWithSRGBRed_green_blue_alpha_(0.30, 0.19, 0.03, 1.0),
+    "info": AppKit.NSColor.colorWithSRGBRed_green_blue_alpha_(0.10, 0.14, 0.22, 1.0),
+}
+NOTICE_TEXT_COLOR = AppKit.NSColor.colorWithSRGBRed_green_blue_alpha_(
+    0.94, 0.94, 0.92, 1.0
+)
+NOTICE_DETAIL_COLOR = AppKit.NSColor.colorWithSRGBRed_green_blue_alpha_(
+    0.78, 0.78, 0.76, 1.0
+)
+
+# Sized as a fraction of the circle's radius so the notice stays legible
+# whatever this owner's calibration turns out to be, rather than being
+# tuned to one unit's 439px and quietly overflowing on another's.
+NOTICE_HEADLINE_RADIUS_FRACTION = 0.155
+NOTICE_DETAIL_RADIUS_FRACTION = 0.093
+#: The text column, as a fraction of the circle's diameter. Well inside
+#: the circle: a chord near the edge is much shorter than the diameter,
+#: so text laid out to the full width would be clipped by the curve.
+NOTICE_TEXT_WIDTH_FRACTION = 0.70
+
 
 def source_crop_rect(image_size: tuple[float, float]) -> AppKit.NSRect:
     """Centered square crop, independent of destination size. A
@@ -128,6 +156,11 @@ class CircularImageView(AppKit.NSView):
     _blank_to: float = 0.0
     _blank_start: float = 0.0
     _blank_duration: float = 0.0
+    # The current notice as a plain dict (headline/detail/severity), or
+    # None to show pictures. A dict rather than the `notice.Notice`
+    # dataclass so this AppKit class holds no import of the logic module
+    # it renders for, matching how calibration values arrive here.
+    _notice: dict | None = None
 
     def isFlipped(self) -> bool:
         # Matches calibration.json's coordinate convention (top-left
@@ -135,6 +168,24 @@ class CircularImageView(AppKit.NSView):
         # for the same override and why it matters: get this wrong and
         # the mask is vertically mirrored relative to the calibration.
         return True
+
+    def setNotice_(self, notice: dict | None) -> None:
+        """Show a notice, or pass None to go back to pictures.
+
+        Idempotent: an unchanged notice does not redraw, so the 30-minute
+        poll cycle re-asserting the same fault does not flicker the
+        screen every time.
+        """
+        if notice == self._notice:
+            return
+        self._notice = notice
+        self.setNeedsDisplay_(True)
+
+    def currentNotice(self) -> dict | None:
+        """What is on the glass right now — read by the smoke test and by
+        `tools/status.py` so verification asks the renderer rather than
+        inferring from the poll that was *supposed* to set it."""
+        return self._notice
 
     def setImagePath_(self, path: str | Path | None) -> None:
         """Instant swap, no fade. Cancels any in-progress crossfade."""
@@ -276,9 +327,95 @@ class CircularImageView(AppKit.NSView):
         )
 
     @objc.python_method
+    def _paragraph_style(self) -> AppKit.NSParagraphStyle:
+        style = AppKit.NSMutableParagraphStyle.alloc().init()
+        style.setAlignment_(AppKit.NSTextAlignmentCenter)
+        style.setLineBreakMode_(AppKit.NSLineBreakByWordWrapping)
+        return style
+
+    @objc.python_method
+    def _draw_notice(self, clip_path: AppKit.NSBezierPath) -> None:
+        """Paint the current notice inside the circle.
+
+        Drawn as a filled disc plus centred text rather than an overlay on
+        the last good picture: a photograph behind an error message is
+        both unreadable and ambiguous about whether the picture is
+        current. The whole circle changing is the signal.
+        """
+        notice = self._notice
+        fill = NOTICE_FILL_COLORS.get(
+            notice.get("severity", "info"), NOTICE_FILL_COLORS["info"]
+        )
+        fill.set()
+        clip_path.fill()
+
+        rect = destination_rect(self.calibration)
+        radius = self.calibration.effective_radius_px
+        width = rect.size.width * NOTICE_TEXT_WIDTH_FRACTION
+        style = self._paragraph_style()
+
+        headline_font = AppKit.NSFont.boldSystemFontOfSize_(
+            max(11.0, radius * NOTICE_HEADLINE_RADIUS_FRACTION)
+        )
+        detail_font = AppKit.NSFont.systemFontOfSize_(
+            max(9.0, radius * NOTICE_DETAIL_RADIUS_FRACTION)
+        )
+        headline_attrs = {
+            AppKit.NSFontAttributeName: headline_font,
+            AppKit.NSForegroundColorAttributeName: NOTICE_TEXT_COLOR,
+            AppKit.NSParagraphStyleAttributeName: style,
+        }
+        detail_attrs = {
+            AppKit.NSFontAttributeName: detail_font,
+            AppKit.NSForegroundColorAttributeName: NOTICE_DETAIL_COLOR,
+            AppKit.NSParagraphStyleAttributeName: style,
+        }
+
+        headline = AppKit.NSString.stringWithString_(notice.get("headline", ""))
+        detail = AppKit.NSString.stringWithString_(notice.get("detail", ""))
+        bounding = AppKit.NSMakeSize(width, rect.size.height)
+        opts = AppKit.NSStringDrawingUsesLineFragmentOrigin
+
+        headline_size = headline.boundingRectWithSize_options_attributes_(
+            bounding, opts, headline_attrs
+        ).size
+        detail_size = detail.boundingRectWithSize_options_attributes_(
+            bounding, opts, detail_attrs
+        ).size
+
+        gap = radius * 0.06
+        total = headline_size.height + gap + detail_size.height
+        # Vertically centred on the circle's centre, so the block stays
+        # balanced in the round aperture no matter how far the detail
+        # text wrapped.
+        top = self.calibration.center_y - total / 2.0
+        left = self.calibration.center_x - width / 2.0
+
+        headline.drawWithRect_options_attributes_(
+            AppKit.NSMakeRect(left, top, width, headline_size.height),
+            opts,
+            headline_attrs,
+        )
+        detail.drawWithRect_options_attributes_(
+            AppKit.NSMakeRect(
+                left, top + headline_size.height + gap, width, detail_size.height
+            ),
+            opts,
+            detail_attrs,
+        )
+
+    @objc.python_method
     def _draw_content(self, clip_path: AppKit.NSBezierPath) -> None:
-        """The picture (or the empty-fill) inside the circle — every
-        drawing case that is not blanking."""
+        """The picture (or the notice, or the empty-fill) inside the
+        circle — every drawing case that is not blanking."""
+        # Ahead of everything else: when a notice is set it must win even
+        # if a perfectly good cached picture is available, because "show
+        # the last good image and say nothing" is precisely the silent
+        # failure this exists to prevent.
+        if self._notice is not None:
+            self._draw_notice(clip_path)
+            return
+
         fading = self._fade_progress < 1.0
         if self._image is None and not (fading and self._fade_from_image is not None):
             EMPTY_FILL_COLOR.set()

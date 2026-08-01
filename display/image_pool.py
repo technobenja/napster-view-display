@@ -34,7 +34,14 @@ from typing import Any
 
 import httpx
 
-from display.sources.base import ImageRecord, is_safe_id, make_display_label
+from display import read_token
+from display.sources.base import (
+    ImageRecord,
+    ListOutcome,
+    ListStatus,
+    is_safe_id,
+    make_display_label,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -114,6 +121,12 @@ class ImageServerClientConfig:
     pool: str = "starred"  # "starred" | "all"
     timeout_s: float = REQUEST_TIMEOUT_S
     max_retries: int = MAX_RETRIES
+    #: Appliance read token, or None to stay anonymous. Applied
+    #: per-request to the listing call only — never as a client default
+    #: header, because `http_client` is deliberately shared with the image
+    #: byte fetches in `sources/image_server.py` and those must stay
+    #: anonymous. See `read_token` and test_read_token.py.
+    read_token: str | None = None
 
 
 class ImageServerClient:
@@ -128,6 +141,7 @@ class ImageServerClient:
         transport: httpx.BaseTransport | None = None,
     ) -> None:
         self._config = config
+        self._last_status = ListStatus()
         self._client = httpx.Client(
             base_url=config.base_url,
             timeout=config.timeout_s,
@@ -143,6 +157,25 @@ class ImageServerClient:
             return {"starred": "true"}
         return {}
 
+    def _list_headers(self) -> dict[str, str]:
+        """Auth headers for the **listing call only**.
+
+        Deliberately not `httpx.Client(headers=...)`: `http_client` is
+        handed to `sources/image_server.py` to stream image bytes, and a
+        client-level default would put the credential on every one of
+        those anonymous `/images/<id>` GETs too. Widening the blast
+        radius of a secret by one config keyword is exactly the kind of
+        change that reads as harmless in a diff, so the narrow form is
+        the one that ships. `test_read_token.py` asserts the byte fetch
+        carries no such header.
+        """
+        token = self._config.read_token
+        if not token:
+            return {}
+        if not read_token.may_send_to(self._config.base_url):
+            return {}
+        return {read_token.READ_TOKEN_HEADER: token}
+
     def list_images(self) -> list[ImageRecord]:
         """`GET /api/images`, filtered to usable rows via `_is_usable`.
 
@@ -153,10 +186,37 @@ class ImageServerClient:
         last_exc: Exception | None = None
         for attempt in range(self._config.max_retries + 1):
             try:
-                resp = self._client.get("/api/images", params=self._params)
+                headers = self._list_headers()
+                sent_credential = bool(headers)
+                resp = self._client.get(
+                    "/api/images", params=self._params, headers=headers
+                )
+                # Checked before raise_for_status() collapses every 4xx and
+                # 5xx into one exception type. "The credential is wrong"
+                # and "the server is broken" are the two diagnoses a wall
+                # display most needs to tell apart, and they are only
+                # separable here, while the status code still exists.
+                if resp.status_code in (401, 403):
+                    self._last_status = ListStatus(
+                        outcome=ListOutcome.UNAUTHORIZED,
+                        detail=f"HTTP {resp.status_code}",
+                        credential_sent=sent_credential,
+                    )
+                    logger.warning(
+                        "Image Server rejected the credential (HTTP %d).",
+                        resp.status_code,
+                    )
+                    return []
                 resp.raise_for_status()
                 rows = resp.json()
-                return [record_from_api(row) for row in rows if _is_usable(row)]
+                records = [record_from_api(row) for row in rows if _is_usable(row)]
+                row_count = len(rows) if isinstance(rows, list) else 0
+                self._last_status = ListStatus(
+                    outcome=ListOutcome.OK if records else ListOutcome.EMPTY,
+                    rows_returned=row_count,
+                    credential_sent=sent_credential,
+                )
+                return records
             except (httpx.TimeoutException, httpx.HTTPStatusError, httpx.TransportError) as exc:
                 last_exc = exc
                 if attempt < self._config.max_retries:
@@ -172,9 +232,26 @@ class ImageServerClient:
                 # callers never see an inconsistent partial pool for one
                 # malformed response.
                 logger.warning("Image Server returned malformed data: %s", exc)
+                # Malformed is a server-side fault, not an auth or empty
+                # one: "unreachable" is the honest bucket for "answered,
+                # but not with anything this app can use".
+                self._last_status = ListStatus(
+                    outcome=ListOutcome.UNREACHABLE,
+                    detail=f"malformed response ({type(exc).__name__})",
+                    credential_sent=sent_credential,
+                )
                 return []
         logger.warning("Image Server list_images failed after retries: %s", last_exc)
+        self._last_status = ListStatus(
+            outcome=ListOutcome.UNREACHABLE,
+            detail=type(last_exc).__name__ if last_exc else "unknown",
+        )
         return []
+
+    @property
+    def last_status(self) -> ListStatus:
+        """Outcome of the most recent `list_images()`."""
+        return self._last_status
 
     @property
     def http_client(self) -> httpx.Client:

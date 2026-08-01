@@ -271,5 +271,117 @@ class BlankingTests(unittest.TestCase):
         )
 
 
+class NoticeRenderingTests(unittest.TestCase):
+    """**These tests draw.** They render `drawRect_` into an offscreen
+    bitmap and count actual pixels.
+
+    That contradicts this module's own docstring above, which says
+    drawing cannot be covered because it needs a window server. That was
+    true of `screencapture` against a real display; it is not true of
+    `cacheDisplayInRect:toBitmapImageRep:`, which composites offscreen.
+    The claim was never re-tested after it was written — pattern-absent is
+    not feature-absent, the same trap in the other direction.
+
+    This matters more here than anywhere else in the app: a notice that
+    silently fails to draw leaves precisely the blank circle the whole
+    feature exists to prevent, and no state-machine assertion would
+    notice. So the assertions are about ink on the glass, not flags.
+    """
+
+    SEVERITIES = ("error", "warning", "info")
+
+    def _render(self, notice_dict):
+        rect = AppKit.NSMakeRect(0, 0, 960, 960)
+        view = CircularImageView.alloc().initWithFrame_(rect)
+        view.calibration = CALIBRATION
+        view.setNotice_(notice_dict)
+        rep = view.bitmapImageRepForCachingDisplayInRect_(rect)
+        if rep is None:  # pragma: no cover - no compositing available
+            self.skipTest("no offscreen graphics context in this environment")
+        view.cacheDisplayInRect_toBitmapImageRep_(rect, rep)
+        return rep
+
+    @staticmethod
+    def _count(rep):
+        """(bright pixels, mid-tone pixels). Bright is text; mid-tone is
+        the severity backdrop. Sampled every other pixel — this is a
+        smoke test for 'is there ink', not a rendering diff."""
+        bright = mid = 0
+        width, height = int(rep.pixelsWide()), int(rep.pixelsHigh())
+        for y in range(0, height, 2):
+            for x in range(0, width, 2):
+                color = rep.colorAtX_y_(x, y)
+                r = color.redComponent()
+                g = color.greenComponent()
+                b = color.blueComponent()
+                if r + g + b < 0.05:
+                    continue
+                if r > 0.6 and g > 0.6 and b > 0.6:
+                    bright += 1
+                else:
+                    mid += 1
+        return bright, mid
+
+    def _notice(self, severity):
+        return {
+            "kind": severity,
+            "headline": "Not authorised",
+            "detail": (
+                "The picture server rejected this display's access token. "
+                "Re-store it in the keychain."
+            ),
+            "severity": severity,
+        }
+
+    def test_a_notice_puts_text_on_the_glass(self):
+        for severity in self.SEVERITIES:
+            with self.subTest(severity=severity):
+                bright, mid = self._count(self._render(self._notice(severity)))
+                self.assertGreater(
+                    bright, 500, "the notice text was not drawn"
+                )
+                self.assertGreater(
+                    mid, 10_000, "the notice backdrop was not filled"
+                )
+
+    def test_no_notice_draws_no_text(self):
+        """The charcoal empty-fill must stay exactly as it was — a stray
+        notice on a healthy display would be its own kind of lie."""
+        bright, _mid = self._count(self._render(None))
+        self.assertLess(bright, 200)
+
+    def test_the_severities_are_visually_distinct(self):
+        """Three different faults, three different colours. If two
+        collapsed to the same backdrop the diagnosis would survive in the
+        text but be lost at a glance, which is the range a wall display
+        is usually read from."""
+        centres = set()
+        for severity in self.SEVERITIES:
+            rep = self._render(self._notice(severity))
+            color = rep.colorAtX_y_(int(rep.pixelsWide()) // 2, int(rep.pixelsHigh()) // 2)
+            centres.add(
+                (
+                    round(color.redComponent(), 2),
+                    round(color.greenComponent(), 2),
+                    round(color.blueComponent(), 2),
+                )
+            )
+        self.assertEqual(len(centres), len(self.SEVERITIES))
+
+    def test_setting_the_same_notice_twice_does_not_redraw(self):
+        """The poll re-asserts the same fault every 30 minutes; that must
+        not flicker the screen."""
+        view = CircularImageView.alloc().initWithFrame_(
+            AppKit.NSMakeRect(0, 0, 960, 960)
+        )
+        view.calibration = CALIBRATION
+        notice_dict = self._notice("error")
+        view.setNotice_(notice_dict)
+        self.assertEqual(view.currentNotice(), notice_dict)
+        # Equal-but-distinct dict: the guard must compare by value.
+        view.setNotice_(dict(notice_dict))
+        self.assertEqual(view.currentNotice(), notice_dict)
+
+
 if __name__ == "__main__":
     unittest.main()

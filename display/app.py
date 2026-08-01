@@ -25,6 +25,7 @@ import AppKit
 import objc
 
 from display import control
+from display import notice
 from display import paths
 from display import single_instance
 from display.atomic_io import atomic_write_json
@@ -40,6 +41,7 @@ from display.display_target import get_view_screen
 from display.image_store import DirectStore
 from display.log_rotation import rotate_if_oversized
 from display.rotation import Rotation
+from display.sources.base import ListOutcome
 from display.sources.factory import build_source
 from display.settings import Settings, load_settings_resolved, settings_watcher
 from display.smoke_test import install_signal_handlers
@@ -139,6 +141,46 @@ class _ClearSentinel:
 CLEAR = _ClearSentinel()
 
 
+def _poll_error_text(status, source_label: str) -> str:
+    """The `last_error` line for status.json, using the real diagnosis
+    when the source provides one.
+
+    Kept module-level and AppKit-free so it is testable without a window,
+    and separate from `notice.py` because that module writes for a 2.1"
+    circle while this writes for a menu bar and a log."""
+    where = source_label or "the image server"
+    outcome = getattr(status, "outcome", None)
+    if outcome is ListOutcome.UNAUTHORIZED:
+        return (
+            f"{where} rejected this display's access token "
+            f"({getattr(status, 'detail', '') or 'unauthorised'})."
+        )
+    if outcome is ListOutcome.UNREACHABLE:
+        detail = getattr(status, "detail", "")
+        return f"Couldn't reach {where}{f' ({detail})' if detail else ''}."
+    if outcome is ListOutcome.EMPTY:
+        rows = getattr(status, "rows_returned", 0)
+        if rows:
+            return (
+                f"{where} returned {rows} pictures, but none are finished "
+                f"and error-free yet."
+            )
+        if getattr(status, "credential_sent", False):
+            # See notice.py: a rejected token answers 200/0 rows here, not
+            # 401, so this case cannot be resolved — only reported.
+            return (
+                f"{where} sent no pictures. The access token may have been "
+                f"rejected, which is indistinguishable from an empty "
+                f"library on this server."
+            )
+        return f"{where} is reachable, but it has no pictures matching this pool."
+    # A source that does not report an outcome gets the old honest hedge.
+    return (
+        f"Couldn't get pictures from {where}. It may be unreachable, or it "
+        f"may have no pictures in it."
+    )
+
+
 def merge_status(**fields) -> None:
     """Merge `fields` into status.json, atomically ("a small local
     status file ... the owner can check if they think to").
@@ -185,6 +227,15 @@ class Coordinator(AppKit.NSObject):
     resolution — Bootstrapper below owns the "screen not found yet"
     startup phase."""
 
+    # Class-level defaults, matching window.py's convention for PyObjC
+    # classes. Notice state specifically must not depend on the designated
+    # initializer having run: `_apply_notice` is reached from a timer
+    # selector inside a broad `except`, so an AttributeError here would be
+    # swallowed and would silently disable the error state — the one
+    # feature whose entire purpose is to not fail silently.
+    _last_outcome = None
+    _consecutive_outcome = 0
+
     def initWithScreen_calibration_settings_(self, screen, calibration, settings):
         self = objc.super(Coordinator, self).init()
         if self is None:
@@ -228,6 +279,11 @@ class Coordinator(AppKit.NSObject):
         self._started_at = time.time()
         self._poll_timer = None
         self._rotation_timer = None
+        # How many polls in a row have now ended in `_last_outcome`.
+        # Drives notice.py's grace period, which is what stops one
+        # dropped packet replacing a photograph with an error card.
+        self._last_outcome = None
+        self._consecutive_outcome = 0
         # Id -> human-readable label, refreshed from each poll's
         # records. Held here rather than in the cache manifest because it
         # is display metadata, not something worth persisting: a label
@@ -371,6 +427,9 @@ class Coordinator(AppKit.NSObject):
         and take down the run loop."""
         try:
             records = self._source.list_images()
+            # Read straight after the call and before anything else can
+            # touch the source: this is the diagnosis for *this* poll.
+            list_status = self._source.last_status
             if records:
                 # This is bounded to MAX_DOWNLOADS_PER_SYNC downloads;
                 # the remainder arrive over the next few polls.
@@ -404,10 +463,18 @@ class Coordinator(AppKit.NSObject):
                     last_error=CLEAR,
                     last_error_at=CLEAR,
                 )
+                self._apply_notice(list_status)
             else:
+                # Built with str() rather than concatenation: this is a
+                # log line, and a log line must never be able to end the
+                # poll it is describing. A source is something a stranger
+                # is invited to write, so `last_status` is not guaranteed
+                # to hold the types this format string would like.
                 print(
-                    "Poll returned no usable images (failure or a genuinely "
-                    "empty pool) — cache and rotation left unchanged.",
+                    "Poll returned no usable images "
+                    f"({getattr(list_status.outcome, 'value', 'unknown')}: "
+                    f"{str(getattr(list_status, 'detail', '')) or 'no detail'}) "
+                    "— cache and rotation left unchanged.",
                     file=sys.stderr,
                 )
                 self._write_status(
@@ -416,20 +483,20 @@ class Coordinator(AppKit.NSObject):
                     last_poll_count=0,
                     image_count=self._image_count(),
                     source_label=self._source_label(),
-                    # "there is no error string; last_poll_ok:
-                    # false says *that* something broke, never *what*."
-                    # This is the honest wording for the one thing the
-                    # source contract actually lets us know here
-                    # has list_images() return [] for both "unreachable"
-                    # and "genuinely empty", and claiming to distinguish
-                    # them would be inventing a diagnosis.
-                    last_error=(
-                        f"Couldn't get pictures from {self._source_label()}. "
-                        f"It may be unreachable, or it may have no pictures "
-                        f"in it."
+                    # The old wording here said the source "may be
+                    # unreachable, or may have no pictures in it",
+                    # because list_images() returned [] for both and
+                    # claiming to distinguish them would have been
+                    # inventing a diagnosis. `last_status` now carries the
+                    # real one, so the hedge is no longer honest — it is
+                    # just vague. Fall back to the hedge only for a source
+                    # that genuinely does not report an outcome.
+                    last_error=_poll_error_text(
+                        list_status, self._source_label()
                     ),
                     last_error_at=time.time(),
                 )
+                self._apply_notice(list_status)
         except Exception:
             print(
                 f"pollImageServer_: unexpected exception, ignoring this "
@@ -497,6 +564,53 @@ class Coordinator(AppKit.NSObject):
                 f"tick:\n{traceback.format_exc()}",
                 file=sys.stderr,
             )
+
+    @objc.python_method
+    def _apply_notice(self, status) -> None:
+        """Translate the poll's outcome into what the glass shows.
+
+        The consecutive counter lives here rather than in `notice.py` so
+        that module stays a pure function of (status, count) and is
+        testable without a poll loop.
+        """
+        outcome = getattr(status, "outcome", None)
+        if outcome == self._last_outcome:
+            self._consecutive_outcome += 1
+        else:
+            self._last_outcome = outcome
+            self._consecutive_outcome = 1
+
+        current = notice.notice_for(
+            status,
+            consecutive=self._consecutive_outcome,
+            have_images=self._image_count() > 0,
+            source_label=self._source_label(),
+        )
+        view = self._window.contentView()
+        view.setNotice_(
+            None
+            if current is None
+            else {
+                "kind": current.kind,
+                "headline": current.headline,
+                "detail": current.detail,
+                "severity": current.severity,
+            }
+        )
+        if current is None:
+            self._write_status(
+                notice_kind=CLEAR,
+                notice_headline=CLEAR,
+                notice_detail=CLEAR,
+                notice_severity=CLEAR,
+            )
+        else:
+            print(
+                f"Notice on the glass: [{current.severity}] {current.headline} "
+                f"— {current.detail}",
+                file=sys.stderr,
+            )
+            self._write_status(**current.as_status_fields())
 
     @objc.python_method
     def _show_current(self, fade: bool) -> None:

@@ -39,7 +39,7 @@ from display.image_pool import (
     ImageServerClientConfig,
 )
 from display.sources import net
-from display.sources.base import ImageRecord, ImageSource
+from display.sources.base import ImageRecord, ImageSource, ListStatus
 
 logger = logging.getLogger(__name__)
 
@@ -59,12 +59,20 @@ class ImageServerSource(ImageSource):
         pool: str = DEFAULT_POOL,
         timeout_s: float = REQUEST_TIMEOUT_S,
         transport: httpx.BaseTransport | None = None,
+        read_token: str | None = None,
     ) -> None:
         self._base_url = base_url.rstrip("/")
         self._pool = pool if pool in VALID_POOLS else DEFAULT_POOL
         self._client = ImageServerClient(
             config=ImageServerClientConfig(
-                base_url=self._base_url, pool=self._pool, timeout_s=timeout_s
+                base_url=self._base_url,
+                pool=self._pool,
+                timeout_s=timeout_s,
+                # Injected, not read from the keychain in here: this class
+                # ships publicly as the worked example of an adapter, and
+                # a source that reaches for a credential on its own is a
+                # worse example than one handed what it needs.
+                read_token=read_token,
             ),
             transport=transport,
         )
@@ -93,6 +101,12 @@ class ImageServerSource(ImageSource):
 
     def list_images(self) -> list[ImageRecord]:
         return self._client.list_images()
+
+    @property
+    def last_status(self) -> ListStatus:
+        """Delegated to the client, which is where the HTTP status code
+        that distinguishes 401 from 503 actually exists."""
+        return self._client.last_status
 
     def _image_path(self, record: ImageRecord) -> str:
         """`/images/<id><ext>` — the id-derived, safe-by-construction

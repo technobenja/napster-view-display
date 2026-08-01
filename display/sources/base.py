@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import abc
 import dataclasses
+import enum
 import hashlib
 import re
 from pathlib import Path
@@ -82,6 +83,59 @@ def stable_id_from_path(path: Path | str) -> str:
     """
     absolute = str(Path(path).resolve())
     return hashlib.sha256(absolute.encode("utf-8")).hexdigest()[:16]
+
+
+class ListOutcome(enum.Enum):
+    """Why the last `list_images()` returned what it did.
+
+    This exists because the old contract — `[]` for everything — is
+    indistinguishable on a wall display from "there are no pictures".
+    A screen bolted to a wall has no log, no console and no user holding
+    it; the glass is the only channel, so the three failures below have to
+    be separable *at the source* or the display can only ever guess.
+
+    They are separated because they have different fixes:
+      UNREACHABLE  -> the server or the LAN is down
+      UNAUTHORIZED -> the credential is wrong, rotated, or missing
+      EMPTY        -> reachable and authorised, but nothing matched
+    """
+
+    OK = "ok"
+    EMPTY = "empty"
+    UNAUTHORIZED = "unauthorized"
+    UNREACHABLE = "unreachable"
+
+
+@dataclasses.dataclass(frozen=True)
+class ListStatus:
+    """The outcome of one listing call, plus enough detail to say
+    something true on screen."""
+
+    outcome: ListOutcome = ListOutcome.OK
+    #: Rows the server sent, *before* `_is_usable` filtering. Lets the
+    #: display distinguish "the server has no starred pictures" from "the
+    #: server sent 50 rows and none of them were usable" — same empty
+    #: pool, completely different fix.
+    rows_returned: int = 0
+    #: Short technical reason ("HTTP 401", "timeout"), for status.json and
+    #: the log. Not shown on the glass; the glass gets plain English.
+    detail: str = ""
+    #: Whether this request actually carried a credential.
+    #:
+    #: 🔴 Load-bearing, and it exists because measurement contradicted the
+    #: plan. A *wrong* token does not produce 401 here: the server's
+    #: check fails closed to the anonymous tier, which returns HTTP 200
+    #: with zero rows. So "bad credential" and "genuinely empty" are
+    #: indistinguishable in the response — the only thing that separates
+    #: them is knowing whether we sent a token at all, which only the
+    #: client knows. Without this flag the display confidently reports
+    #: "authorised, but nothing matched" at the exact moment the token is
+    #: broken, which is the worst of the available lies.
+    credential_sent: bool = False
+
+    @property
+    def ok(self) -> bool:
+        return self.outcome is ListOutcome.OK
 
 
 @dataclasses.dataclass(frozen=True)
@@ -156,9 +210,25 @@ class ImageSource(abc.ABC):
 
     @abc.abstractmethod
     def list_images(self) -> list[ImageRecord]:
-        """Current contents of the source. `[]` on any failure — callers
-        cannot distinguish "empty" from "unreachable" and deliberately
-        treat both as "no update this poll"."""
+        """Current contents of the source. `[]` on any failure.
+
+        The return type stays a bare list — every caller and the whole
+        cache/rotation path is built on it. *Why* it was empty is reported
+        alongside, on `last_status`, so adding the diagnosis did not
+        require rewriting the contract that works.
+        """
+
+    @property
+    def last_status(self) -> ListStatus:
+        """Outcome of the most recent `list_images()`.
+
+        The default is deliberately honest rather than optimistic: a
+        source that has not been asked yet, or one that does not
+        distinguish failures, reports OK and the display shows nothing
+        unusual. Only sources that genuinely know better override this —
+        claiming a diagnosis you cannot make is worse than making none.
+        """
+        return getattr(self, "_last_status", ListStatus())
 
     @abc.abstractmethod
     def fetch(self, record: ImageRecord) -> bytes | None:
@@ -189,6 +259,8 @@ __all__ = [
     "SAFE_ID_RE",
     "ImageRecord",
     "ImageSource",
+    "ListOutcome",
+    "ListStatus",
     "is_safe_id",
     "make_display_label",
     "stable_id_from_path",

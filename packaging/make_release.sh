@@ -120,7 +120,19 @@ rm -f "$SRC/display/README.md" "$SRC/ui/README.md"
 # 3. Build venv, also at a neutral path (see header)
 # ---------------------------------------------------------------------
 say "build venv -> $VENV"
-/usr/bin/env python3 -m venv "$VENV"
+# PINNED, not `/usr/bin/env python3`. The interpreter is part of the
+# shipped artifact — py2app embeds a whole Python framework in the
+# bundle — so letting it float means the release silently changes what
+# users run whenever Homebrew moves `python3`. That already happened
+# once: 3.13 -> 3.14 between v1.0.1 and this build, noticed only because
+# an unrelated gate had the old version hardcoded and failed.
+#
+# Overridable for a deliberate, tested interpreter bump; the point is
+# that bumping it is a decision someone makes, not weather.
+VIEWLAB_PYTHON="${VIEWLAB_PYTHON:-/opt/homebrew/opt/python@3.13/bin/python3.13}"
+[ -x "$VIEWLAB_PYTHON" ] || fail "no interpreter at $VIEWLAB_PYTHON (set VIEWLAB_PYTHON to override)"
+echo "  interpreter: $VIEWLAB_PYTHON ($("$VIEWLAB_PYTHON" --version 2>&1))"
+"$VIEWLAB_PYTHON" -m venv "$VENV"
 # Deliberately NOT the `pyobjc` umbrella: modulegraph would chase ~200
 # framework wrappers (~70MB) into the bundle (§6.5).
 "$VENV/bin/pip" install --quiet --upgrade pip
@@ -148,7 +160,7 @@ codesign --force --deep --sign - "$APP"
 # ---------------------------------------------------------------------
 # 6. VERIFY — §6.5 gates. These fail the build; they do not warn.
 # ---------------------------------------------------------------------
-say "gate 1/5: no /opt/homebrew linkage in lib-dynload"
+say "gate 1/6: no /opt/homebrew linkage in lib-dynload"
 # If macholib misses one (most often _ssl, _sqlite3, _hashlib) it fails
 # only on a machine without Homebrew — i.e. every recipient — and it
 # fails on HTTPS, which is the whole point of the URL sources.
@@ -157,7 +169,7 @@ BREW_COUNT="$(otool -L "$APP"/Contents/Resources/lib/python*/lib-dynload/*.so 2>
 echo "  /opt/homebrew references: $BREW_COUNT"
 [ "$BREW_COUNT" -eq 0 ] || fail "$BREW_COUNT Homebrew dylib references in lib-dynload"
 
-say "gate 2/5: whole-bundle binary-aware identity sweep (§11 assertion 4)"
+say "gate 2/6: whole-bundle binary-aware identity sweep (§11 assertion 4)"
 # Delegated to `release_gate.py` rather than reimplemented here. This
 # script used to carry its own narrower grep, and the two checks drifted
 # — which is exactly how §11's original wording ended up certifying a
@@ -176,7 +188,7 @@ say "gate 2/5: whole-bundle binary-aware identity sweep (§11 assertion 4)"
 "$VENV/bin/python" "$REPO/release_gate.py" --sweep-bundle "$APP" \
   || fail "first-party identity leak in the bundle"
 
-say "gate 3/5: every first-party module is actually in the bundle"
+say "gate 3/6: every first-party module is actually in the bundle"
 # setup.py names modules explicitly (see its docstring). A hand-kept
 # list silently rots: modulegraph does not follow a lazy import, so a
 # module that moves behind one — as `ui.calibrate_window` already has —
@@ -188,6 +200,17 @@ say "gate 3/5: every first-party module is actually in the bundle"
 ZIPLIST="$BUILD_ROOT/ziplist.txt"
 unzip -l "$APP"/Contents/Resources/lib/python3*.zip >"$ZIPLIST" 2>/dev/null || true
 
+# Derived, never hardcoded. This line used to read `python3.13`, and when
+# Homebrew's `python3` moved to 3.14 the path stopped existing — so every
+# module looked absent and the gate failed the build with a message
+# ("present in the build tree but absent from the bundle") that pointed
+# at the bundle rather than at itself. A version pinned in one gate and
+# floating everywhere else is a tripwire for the toolchain, not for the
+# bundle.
+PYLIB="$(ls -d "$APP"/Contents/Resources/lib/python3.* 2>/dev/null | head -1)"
+[ -n "$PYLIB" ] || fail "no lib/python3.* directory in the bundle"
+echo "  bundle stdlib: $(basename "$PYLIB")"
+
 MISSING=""
 for f in "$SRC"/display/*.py "$SRC"/display/sources/*.py "$SRC"/ui/*.py; do
   [ -e "$f" ] || continue
@@ -196,7 +219,7 @@ for f in "$SRC"/display/*.py "$SRC"/display/sources/*.py "$SRC"/ui/*.py; do
   pkgdir="$(dirname "$rel")"
   # Two shapes: `display/` is filesystem-copied as source, `ui/` and
   # `display.sources` are byte-compiled into python3NN.zip.
-  [ -e "$APP/Contents/Resources/lib/python3.13/$rel" ] && continue
+  [ -e "$PYLIB/$rel" ] && continue
   grep -q " $pkgdir/$stem\.pyc\$" "$ZIPLIST" && continue
   MISSING="$MISSING $rel"
 done
@@ -206,10 +229,10 @@ if [ -n "$MISSING" ]; then
 fi
 echo "  all first-party modules present"
 
-say "gate 4/5: --selftest from inside the bundle"
+say "gate 4/6: --selftest from inside the bundle"
 "$APP/Contents/MacOS/ImageView" --selftest || fail "selftest failed"
 
-say "gate 5/5: signature"
+say "gate 5/6: signature"
 codesign --verify --deep --strict --verbose=2 "$APP"
 
 # ---------------------------------------------------------------------
@@ -227,6 +250,26 @@ find "$STAGE" -name .DS_Store -delete
 rm -f "$DMG"
 hdiutil create -volname "ImageView" -srcfolder "$STAGE" -ov -format UDZO -quiet "$DMG"
 
+say "gate 6/6: sweep the .dmg itself (the thing that actually ships)"
+# This gate runs LAST because it is the only one that can: every earlier
+# check ran against an *input* to the artifact, and the artifact did not
+# exist until the line above. The .app was swept, then copied, staged,
+# symlinked and compressed — and nothing re-checked the result.
+#
+# Scanning $DMG's own bytes would prove nothing: UDZO is compressed, so
+# its contents hide from a byte scan exactly the way a DEFLATE zip member
+# and a .pyc already did twice in this project. release_gate mounts it.
+#
+# The .dmg is deleted on failure. A leaking artifact left on disk is one
+# `gh release create` away from being published, and the whole point of a
+# gate is that the bad output does not survive it.
+"$VENV/bin/python" "$REPO/release_gate.py" --sweep-dmg "$DMG" || {
+  rm -f "$DMG"
+  fail "identity or secret leak in the .dmg (artifact deleted)"
+}
+
+# Hashed only after the sweep passes, and never rebuilt afterwards —
+# py2app is not byte-reproducible, so a rebuild would invalidate this.
 SHA="$(shasum -a 256 "$DMG" | cut -d' ' -f1)"
 
 say "done"

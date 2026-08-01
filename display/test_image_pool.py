@@ -14,7 +14,7 @@ import httpx
 
 from display import image_pool
 from display.image_pool import ImageServerClient, ImageServerClientConfig, _is_usable, record_from_api
-from display.sources.base import MAX_ID_CHARS, ImageRecord
+from display.sources.base import MAX_ID_CHARS, ImageRecord, ListOutcome
 
 BASE_URL = "http://images.example:8883"
 
@@ -363,6 +363,89 @@ class ListImagesTests(unittest.TestCase):
             except Exception as exc:  # noqa: BLE001 - this is the assertion
                 self.fail(f"list_images() raised {exc!r} instead of returning []")
         self.assertEqual(records, [])
+
+
+class ListStatusTests(unittest.TestCase):
+    """`last_status` — the diagnosis that lets the display say *why* it
+    has nothing to show. `list_images()` still returns `[]` for all of
+    these; that is the point of reporting the reason separately."""
+
+    @staticmethod
+    def _status_after(handler):
+        client = _client_with_handler(handler)
+        with mock.patch("display.image_pool.time.sleep", return_value=None):
+            records = client.list_images()
+        return records, client.last_status
+
+    def test_success_reports_ok_and_the_row_count(self):
+        records, status = self._status_after(
+            lambda request: httpx.Response(200, json=[GOOD_ROW])
+        )
+        self.assertEqual(len(records), 1)
+        self.assertIs(status.outcome, ListOutcome.OK)
+        self.assertEqual(status.rows_returned, 1)
+        self.assertTrue(status.ok)
+
+    def test_401_reports_unauthorized_not_unreachable(self):
+        """The distinction the whole feature turns on. `raise_for_status`
+        collapses 401 and 503 into one exception type, so this has to be
+        read before it fires."""
+        records, status = self._status_after(
+            lambda request: httpx.Response(401, json={"detail": "nope"})
+        )
+        self.assertEqual(records, [])
+        self.assertIs(status.outcome, ListOutcome.UNAUTHORIZED)
+        self.assertIn("401", status.detail)
+
+    def test_403_also_reports_unauthorized(self):
+        _records, status = self._status_after(
+            lambda request: httpx.Response(403, json={"detail": "nope"})
+        )
+        self.assertIs(status.outcome, ListOutcome.UNAUTHORIZED)
+
+    def test_500_reports_unreachable(self):
+        _records, status = self._status_after(
+            lambda request: httpx.Response(500, text="boom")
+        )
+        self.assertIs(status.outcome, ListOutcome.UNREACHABLE)
+
+    def test_connection_failure_reports_unreachable(self):
+        def handler(request: httpx.Request) -> httpx.Response:
+            raise httpx.ConnectError("simulated", request=request)
+
+        _records, status = self._status_after(handler)
+        self.assertIs(status.outcome, ListOutcome.UNREACHABLE)
+        self.assertEqual(status.detail, "ConnectError")
+
+    def test_malformed_json_reports_unreachable(self):
+        _records, status = self._status_after(
+            lambda request: httpx.Response(200, text="not json at all")
+        )
+        self.assertIs(status.outcome, ListOutcome.UNREACHABLE)
+        self.assertIn("malformed", status.detail)
+
+    def test_empty_list_reports_empty_with_zero_rows(self):
+        """The v2.0.0 tier bug's exact signature: 200, valid JSON, no
+        rows. Must not read as unreachable."""
+        _records, status = self._status_after(
+            lambda request: httpx.Response(200, json=[])
+        )
+        self.assertIs(status.outcome, ListOutcome.EMPTY)
+        self.assertEqual(status.rows_returned, 0)
+
+    def test_rows_that_are_all_unusable_report_empty_with_a_row_count(self):
+        """Reachable, authorised, 2 rows, none usable — a different
+        problem from an empty pool, and the row count is what says so."""
+        pending = dict(GOOD_ROW, status="generating")
+        _records, status = self._status_after(
+            lambda request: httpx.Response(200, json=[pending, pending])
+        )
+        self.assertIs(status.outcome, ListOutcome.EMPTY)
+        self.assertEqual(status.rows_returned, 2)
+
+    def test_status_starts_ok_before_any_poll(self):
+        client = _client_with_handler(lambda request: httpx.Response(200, json=[]))
+        self.assertIs(client.last_status.outcome, ListOutcome.OK)
 
 
 if __name__ == "__main__":
