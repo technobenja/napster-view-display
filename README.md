@@ -54,7 +54,7 @@ shasum -a 256 ~/Downloads/ImageView.dmg
 ```
 
 ```
-SHA-256 (ImageView.dmg) = 490d68f0e7a215c72af239cd464c48ecf13458b45a5cf2af395e86c983afd847
+SHA-256 (ImageView.dmg) = e333e5dc089cd427655d61d5e72eda26f166c174e5739b26e85412b300a2d6bf
 ```
 
 If that does not match, do not open it.
