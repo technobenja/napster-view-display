@@ -1,5 +1,7 @@
 # ImageView — pictures on a Napster View
 
+[![tests](../../actions/workflows/tests.yml/badge.svg)](../../actions/workflows/tests.yml)
+
 Shows a rotating, circular-masked slideshow on a **Napster View** — a 2.1-inch
 round lenticular display — instead of the app it ships with. A small menu bar
 app controls it; a background agent does the drawing.
@@ -164,6 +166,11 @@ running it from inside `display/` puts that directory on `sys.path` instead of
 the root and every `from display import ...` fails.
 
 There are no third-party test dependencies.
+
+The badge at the top is that same suite, run on a clean checkout by GitHub
+Actions on macOS. It is a narrow claim: it does not build the app, does not
+check the release artifact, and cannot see the display. A green badge means
+the unit tests passed — nothing about whether a build is fit to ship.
 
 ## Layout
 
