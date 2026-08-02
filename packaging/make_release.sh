@@ -75,7 +75,76 @@ export SOURCE_DATE_EPOCH
 echo "commit $COMMIT  SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH"
 
 # ---------------------------------------------------------------------
-# 2. Prune first-party dev artifacts that have no business in a shipped app
+# 2. Build venv, at a neutral path (see header)
+# ---------------------------------------------------------------------
+# BEFORE the prune, and that ordering is load-bearing: gate 0 below runs
+# the test suite, and the prune deletes every test file. See gate 0.
+say "build venv -> $VENV"
+# PINNED, not `/usr/bin/env python3`. The interpreter is part of the
+# shipped artifact — py2app embeds a whole Python framework in the
+# bundle — so letting it float means the release silently changes what
+# users run whenever Homebrew moves `python3`. That already happened
+# once: 3.13 -> 3.14 between v1.0.1 and this build, noticed only because
+# an unrelated gate had the old version hardcoded and failed.
+#
+# Overridable for a deliberate, tested interpreter bump; the point is
+# that bumping it is a decision someone makes, not weather.
+VIEWLAB_PYTHON="${VIEWLAB_PYTHON:-/opt/homebrew/opt/python@3.13/bin/python3.13}"
+[ -x "$VIEWLAB_PYTHON" ] || fail "no interpreter at $VIEWLAB_PYTHON (set VIEWLAB_PYTHON to override)"
+echo "  interpreter: $VIEWLAB_PYTHON ($("$VIEWLAB_PYTHON" --version 2>&1))"
+"$VIEWLAB_PYTHON" -m venv "$VENV"
+# Deliberately NOT the `pyobjc` umbrella: modulegraph would chase ~200
+# framework wrappers (~70MB) into the bundle (§6.5).
+"$VENV/bin/pip" install --quiet --upgrade pip
+"$VENV/bin/pip" install --quiet py2app pyobjc-core pyobjc-framework-Cocoa httpx
+"$VENV/bin/python" -c "import py2app; print('py2app', py2app.__version__)"
+
+# ---------------------------------------------------------------------
+# 3. GATE 0 — the test suite, against the tree that is about to ship
+# ---------------------------------------------------------------------
+# make_release.sh would otherwise happily produce a signed, swept,
+# shippable .dmg from a tree whose tests are red. Not hypothetical: a red
+# commit shipped once because the suite was run after the push.
+#
+# 🔴 It runs HERE, not with gates 1-6, and the position is the whole
+# point. The prune below deletes `display/test_*.py` and `ui/test_*.py`,
+# so the same command a hundred lines later would discover ZERO tests —
+# a check that measures nothing, this project's most repeated failure
+# shape. The printed count is the tripwire: if it is not a few hundred,
+# this gate has quietly stopped working.
+#
+# 🔴 Against $SRC, not $REPO. The working tree is not what gets packaged,
+# and a gate that tests something other than the artifact is the same
+# class of bug as sweeping the .app while shipping the .dmg.
+#
+# PYTHONDONTWRITEBYTECODE is not tidiness. Running the suite inside $SRC
+# writes `__pycache__` next to the sources, and the prune removes
+# `display/test_*.py` but not `display/__pycache__/test_*.pyc` — so
+# py2app's directory copy shipped the COMPILED test suite into the
+# bundle. Caught by gate 2 the first time this gate ran:
+# `test_read_token.cpython-313.pyc` carried a 64-hex fixture and tripped
+# the secret-shape term. Belt here, braces in the prune below.
+#
+# One assertion in test_release_gate skips here: $SRC has no `.git`, so
+# manifest tracked-ness cannot be checked (it is asserted in the dev
+# repo). Everything else runs, so the manifest, HARD-term and
+# SOFT-exception checks all run against the exact tree being packaged.
+say "gate 0/7: test suite (against \$SRC, before the prune removes it)"
+TESTLOG="$BUILD_ROOT/tests.log"
+if ! (cd "$SRC" && PYTHONDONTWRITEBYTECODE=1 "$VENV/bin/python" \
+        -m unittest discover -t . -s . -p "test_*.py") \
+     >"$TESTLOG" 2>&1; then
+  tail -40 "$TESTLOG"
+  fail "test suite failed — refusing to build (full log: $TESTLOG)"
+fi
+TESTCOUNT="$(grep -oE '^Ran [0-9]+ test' "$TESTLOG" | grep -oE '[0-9]+' | head -1)"
+echo "  $(tail -1 "$TESTLOG")"
+[ "${TESTCOUNT:-0}" -ge 100 ] \
+  || fail "gate 0 discovered only ${TESTCOUNT:-0} tests — it is not running the suite"
+echo "  $TESTCOUNT tests passed"
+
+# ---------------------------------------------------------------------
+# 4. Prune first-party dev artifacts that have no business in a shipped app
 # ---------------------------------------------------------------------
 # These are tracked files, so the checkout brings them, and py2app's
 # directory copy of `display/` would ship them verbatim. Each is
@@ -115,32 +184,15 @@ rm -f "$SRC/display/STEP0_INSTRUCTIONS.md" "$SRC/display/STEP1_INSTRUCTIONS.md"
 rm -f "$SRC"/display/test_*.py "$SRC"/ui/test_*.py
 rm -f "$SRC/display/demo_transition.py"
 rm -f "$SRC/display/README.md" "$SRC/ui/README.md"
+# Any __pycache__ in the build tree, whatever produced it. py2app copies
+# `display/` as a directory and would ship these verbatim — including
+# compiled copies of the very test files pruned above, whose source is
+# gone but whose .pyc is not. See gate 0.
+find "$SRC" -name "__pycache__" -type d -prune -exec rm -rf {} + 2>/dev/null || true
+
 
 # ---------------------------------------------------------------------
-# 3. Build venv, also at a neutral path (see header)
-# ---------------------------------------------------------------------
-say "build venv -> $VENV"
-# PINNED, not `/usr/bin/env python3`. The interpreter is part of the
-# shipped artifact — py2app embeds a whole Python framework in the
-# bundle — so letting it float means the release silently changes what
-# users run whenever Homebrew moves `python3`. That already happened
-# once: 3.13 -> 3.14 between v1.0.1 and this build, noticed only because
-# an unrelated gate had the old version hardcoded and failed.
-#
-# Overridable for a deliberate, tested interpreter bump; the point is
-# that bumping it is a decision someone makes, not weather.
-VIEWLAB_PYTHON="${VIEWLAB_PYTHON:-/opt/homebrew/opt/python@3.13/bin/python3.13}"
-[ -x "$VIEWLAB_PYTHON" ] || fail "no interpreter at $VIEWLAB_PYTHON (set VIEWLAB_PYTHON to override)"
-echo "  interpreter: $VIEWLAB_PYTHON ($("$VIEWLAB_PYTHON" --version 2>&1))"
-"$VIEWLAB_PYTHON" -m venv "$VENV"
-# Deliberately NOT the `pyobjc` umbrella: modulegraph would chase ~200
-# framework wrappers (~70MB) into the bundle (§6.5).
-"$VENV/bin/pip" install --quiet --upgrade pip
-"$VENV/bin/pip" install --quiet py2app pyobjc-core pyobjc-framework-Cocoa httpx
-"$VENV/bin/python" -c "import py2app; print('py2app', py2app.__version__)"
-
-# ---------------------------------------------------------------------
-# 4. Build
+# 5. Build
 # ---------------------------------------------------------------------
 say "py2app build"
 (cd "$SRC/packaging" && "$VENV/bin/python" setup.py py2app >"$BUILD_ROOT/build.log" 2>&1) \
@@ -149,7 +201,7 @@ say "py2app build"
 echo "built $(du -sh "$APP" | cut -f1)"
 
 # ---------------------------------------------------------------------
-# 5. Ad-hoc sign — AFTER the last file is written
+# 6. Ad-hoc sign — AFTER the last file is written
 # ---------------------------------------------------------------------
 # Mandatory on Apple Silicon: the kernel kills an unsigned arm64 binary
 # at exec. NO `--options runtime`: hardened runtime without a real
@@ -158,9 +210,9 @@ say "ad-hoc sign"
 codesign --force --deep --sign - "$APP"
 
 # ---------------------------------------------------------------------
-# 6. VERIFY — §6.5 gates. These fail the build; they do not warn.
+# 7. VERIFY — §6.5 gates. These fail the build; they do not warn.
 # ---------------------------------------------------------------------
-say "gate 1/6: no /opt/homebrew linkage in lib-dynload"
+say "gate 1/7: no /opt/homebrew linkage in lib-dynload"
 # If macholib misses one (most often _ssl, _sqlite3, _hashlib) it fails
 # only on a machine without Homebrew — i.e. every recipient — and it
 # fails on HTTPS, which is the whole point of the URL sources.
@@ -169,7 +221,7 @@ BREW_COUNT="$(otool -L "$APP"/Contents/Resources/lib/python*/lib-dynload/*.so 2>
 echo "  /opt/homebrew references: $BREW_COUNT"
 [ "$BREW_COUNT" -eq 0 ] || fail "$BREW_COUNT Homebrew dylib references in lib-dynload"
 
-say "gate 2/6: whole-bundle binary-aware identity sweep (§11 assertion 4)"
+say "gate 2/7: whole-bundle binary-aware identity sweep (§11 assertion 4)"
 # Delegated to `release_gate.py` rather than reimplemented here. This
 # script used to carry its own narrower grep, and the two checks drifted
 # — which is exactly how §11's original wording ended up certifying a
@@ -188,7 +240,7 @@ say "gate 2/6: whole-bundle binary-aware identity sweep (§11 assertion 4)"
 "$VENV/bin/python" "$REPO/release_gate.py" --sweep-bundle "$APP" \
   || fail "first-party identity leak in the bundle"
 
-say "gate 3/6: every first-party module is actually in the bundle"
+say "gate 3/7: every first-party module is actually in the bundle"
 # setup.py names modules explicitly (see its docstring). A hand-kept
 # list silently rots: modulegraph does not follow a lazy import, so a
 # module that moves behind one — as `ui.calibrate_window` already has —
@@ -229,14 +281,14 @@ if [ -n "$MISSING" ]; then
 fi
 echo "  all first-party modules present"
 
-say "gate 4/6: --selftest from inside the bundle"
+say "gate 4/7: --selftest from inside the bundle"
 "$APP/Contents/MacOS/ImageView" --selftest || fail "selftest failed"
 
-say "gate 5/6: signature"
+say "gate 5/7: signature"
 codesign --verify --deep --strict --verbose=2 "$APP"
 
 # ---------------------------------------------------------------------
-# 7. .dmg with a drag-to-Applications layout
+# 8. .dmg with a drag-to-Applications layout
 # ---------------------------------------------------------------------
 say "dmg"
 rm -rf "$STAGE"
@@ -250,7 +302,7 @@ find "$STAGE" -name .DS_Store -delete
 rm -f "$DMG"
 hdiutil create -volname "ImageView" -srcfolder "$STAGE" -ov -format UDZO -quiet "$DMG"
 
-say "gate 6/6: sweep the .dmg itself (the thing that actually ships)"
+say "gate 6/7: sweep the .dmg itself (the thing that actually ships)"
 # This gate runs LAST because it is the only one that can: every earlier
 # check ran against an *input* to the artifact, and the artifact did not
 # exist until the line above. The .app was swept, then copied, staged,

@@ -1,0 +1,63 @@
+# Runs the unit suite on a clean checkout, which is the one thing this
+# project had no automation for.
+#
+# ---------------------------------------------------------------------
+# WHAT A GREEN BADGE HERE DOES *NOT* MEAN
+# ---------------------------------------------------------------------
+# It means "the unit suite passed on a clean checkout". It does not mean
+# the tree is releasable, and three checks are structurally invisible to
+# it — this list lives here, next to the badge, so the limitation travels
+# with the thing that could be misread:
+#
+#   * The secret-value sweep reads the macOS login keychain, which only
+#     unlocks in a graphical session. Permanently unavailable to CI.
+#   * The identity sweeps over the built .app and .dmg are driven by
+#     release_gate.py, which is deliberately not part of this repository:
+#     it holds the catalogue of strings that must never appear in a public
+#     build, so publishing it would defeat its own purpose.
+#   * Nothing here touches the physical display. The project's own pixel
+#     checker can report "wallpaper, not the app" purely because the
+#     calling process lacks Screen Recording, so even locally that is not
+#     the last word — a human looking at the glass is.
+#
+# Releasing is `packaging/make_release.sh` on a maintainer's Mac, which
+# runs this same suite as its first gate plus six more.
+#
+# macOS is not a preference. 30 modules under test import AppKit and
+# pyobjc has no Linux build, so a Linux runner cannot even install the
+# dependencies.
+
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  unittest:
+    runs-on: macos-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        # Deliberately not the `pyobjc` umbrella — the app depends on
+        # Cocoa alone, and the umbrella pulls ~200 framework wrappers.
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install httpx pyobjc-core pyobjc-framework-Cocoa
+
+      - name: Run the suite
+        # The exact command the README tells users to run. If this ever
+        # diverges from the README, the README is what users follow.
+        run: python -m unittest discover -t . -s . -p "test_*.py"
