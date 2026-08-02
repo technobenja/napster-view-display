@@ -143,16 +143,34 @@ Two things it does that the manual recipe cannot:
   inside the installed app until this script existed. The only reliable
   filter is what is on disk when py2app runs.
 
-The five gates fail the build rather than warn — a leaking build
-produces no `.dmg`:
+The seven gates fail the build rather than warn — a leaking or broken
+build produces no `.dmg`:
 
 | Gate | Passing means |
 |---|---|
-| Homebrew linkage | `otool -L` over `lib-dynload/*.so` finds **0** `/opt/homebrew` references. Missing one fails only on machines without Homebrew — i.e. every recipient — and it fails on HTTPS |
-| Identity sweep | `find <bundle> -type f -exec grep -l $HOME {} \;` — **binary-aware**. `grep -rl` silently skips binary `.pyc` and once reported 1 file where there were 130 |
-| Module coverage | every non-test module in the tree is really in the bundle. `setup.py` names modules by hand, and modulegraph does not follow a lazy import |
-| `--selftest` | the bundled interpreter does HTTPS 200, finds `certifi`'s `cacert.pem`, loads PyObjC, and reaches its seed config |
-| Signature | `codesign --verify --deep --strict` |
+| 0 · Test suite | the whole suite passes, run against the *build* tree before anything is packaged. It runs here rather than with the gates below because the prune deletes `test_*.py`, so the same check later would discover **zero** tests and pass having measured nothing. The count is printed for exactly that reason |
+| 1 · Homebrew linkage | `otool -L` over `lib-dynload/*.so` finds **0** `/opt/homebrew` references. Missing one fails only on machines without Homebrew — i.e. every recipient |
+| 2 · Bundle identity sweep | **binary- and zip-aware**, reading inside `.pyc` and DEFLATE-compressed zip members. `grep -rl` silently skips binary files and once reported 1 file where there were 130 |
+| 3 · Module coverage | every non-test module in the tree is really in the bundle. `setup.py` names modules by hand, and modulegraph does not follow a lazy import |
+| 4 · `--selftest` | the bundled interpreter does HTTPS 200, finds `certifi`'s `cacert.pem`, loads PyObjC, and reaches its seed config |
+| 5 · Signature | `codesign --verify --deep --strict` |
+| 6 · `.dmg` sweep | the finished disk image, **mounted** and swept. Every other gate runs against an input to the artifact; this is the only one that sees the artifact. A compressed disk image hides its contents from a byte scan, so it has to be mounted |
+
+Gate 0 earned its place immediately: adding it shipped the *compiled* test
+suite into the bundle, because running the tests inside the build tree
+writes `__pycache__` and the prune removed the test sources but not their
+`.pyc`. Gate 2 caught it.
+
+Gates 2 and 6 are driven by a `release_gate.py` that is deliberately not
+part of this repository — it holds the catalogue of strings that must
+never appear in a public build, so publishing it would defeat its own
+purpose. Building from a clone therefore stops at gate 2. The `.app` and
+`.dmg` steps themselves are ordinary py2app and `hdiutil`.
+
+The build interpreter is **pinned** rather than following whatever
+`python3` resolves to; override with `VIEWLAB_PYTHON`. It embeds a whole
+Python framework in the bundle, so letting it float changes what users
+run whenever Homebrew moves.
 
 If the working tree is dirty the script still builds, but says so loudly
 — a published SHA-256 should correspond to a commit.
