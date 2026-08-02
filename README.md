@@ -61,8 +61,26 @@ SHA-256 (ImageView.dmg) = e333e5dc089cd427655d61d5e72eda26f166c174e5739b26e85412
 
 If that does not match, do not open it.
 
-Because the build is ad-hoc signed rather than notarized, macOS will refuse the
-first launch. Right-click the app, choose **Open**, then confirm.
+Because the build is ad-hoc signed rather than notarized, macOS blocks the
+first launch. Getting past that changed in **macOS 15 (Sequoia)**: the old
+Control-click → **Open** shortcut no longer overrides Gatekeeper.
+
+**macOS 15 and later**
+
+1. Try to open **ImageView** from Applications once, and dismiss the warning.
+   The next step does not appear until you have done this.
+2. Open **System Settings → Privacy & Security** and scroll to **Security**.
+3. Beside the note about ImageView, click **Open Anyway** and authenticate.
+4. Open the app again.
+
+**macOS 14 and earlier**
+
+Control-click the app, choose **Open**, then confirm.
+
+This is what an ad-hoc signature costs: macOS can tell the binary has not been
+tampered with since it was signed, but not *who* signed it. Notarizing would
+remove these steps, and is deliberately not done — see **Maintenance posture**
+above. The checksum is the tamper-evidence.
 
 ## Using it
 
