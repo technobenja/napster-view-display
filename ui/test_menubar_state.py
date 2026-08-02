@@ -578,3 +578,45 @@ class TestRoundTripThroughControl(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AboutTextTests(unittest.TestCase):
+    """The About box states the version, so it is the one window whose
+    whole job is a fact that can drift."""
+
+    def test_it_names_both_authors(self):
+        _title, body = ms.about_text("1.1.2")
+        for author in ms.AUTHORS:
+            self.assertIn(author, body)
+
+    def test_the_title_carries_the_version_it_was_given(self):
+        title, _body = ms.about_text("1.1.2")
+        self.assertEqual(title, "ImageView 1.1.2")
+
+    def test_no_version_is_hardcoded_anywhere_in_the_text(self):
+        """🔴 The point of passing the version in. If a release number
+        were baked in here it would be a fourth place the version lives,
+        and the one users actually read — while the release gate asserts
+        setup.py and the git tag agree precisely so that cannot happen."""
+        import re
+
+        title, body = ms.about_text("9.9.9")
+        self.assertIn("9.9.9", title)
+        self.assertEqual(re.findall(r"\d+\.\d+\.\d+", body), [])
+
+    def test_an_unreadable_version_degrades_rather_than_raising(self):
+        """Run from source rather than a bundle, the Info.plist key is
+        absent. An About box is never worth a crash."""
+        for bad in (None, "", "   ", 17, object()):
+            with self.subTest(version=bad):
+                title, body = ms.about_text(bad)
+                self.assertIn("unknown version", title)
+                self.assertTrue(body.strip())
+
+    def test_it_keeps_the_trademark_disclaimer(self):
+        """This app drives someone else's hardware and says so everywhere
+        else it is described; the About box must not be the one place the
+        claim goes missing."""
+        _title, body = ms.about_text("1.1.2")
+        self.assertIn("Not affiliated", body)
+        self.assertIn("trademarks", body)

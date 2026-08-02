@@ -304,6 +304,7 @@ class MenuBarController(AppKit.NSObject):
         )
         menu.addItem_(AppKit.NSMenuItem.separatorItem())
 
+        self._items["about"] = self._add(menu, "About ImageView", "about:")
         self._items["quit"] = self._add(menu, "Quit", "quit:", key="q")
         self._menu = menu
 
@@ -718,6 +719,27 @@ class MenuBarController(AppKit.NSObject):
                 file=sys.stderr,
             )
         return done.returncode == 0
+
+    def about_(self, sender) -> None:
+        """Show the About box.
+
+        The version is read from the **running bundle's** Info.plist, not
+        from a constant in the source. A hardcoded string here would be a
+        fourth place the version lives, and it would be the one users
+        read — the release gate asserts that setup.py and the git tag
+        agree precisely so this cannot drift, and re-introducing the drift
+        in the About box would be self-defeating.
+
+        `NSBundle.mainBundle()` is the installed .app when packaged; run
+        from source it returns the interpreter's bundle and the key is
+        absent, which `about_text` degrades to "unknown version" rather
+        than raising. An About box is never worth a crash.
+        """
+        version = AppKit.NSBundle.mainBundle().objectForInfoDictionaryKey_(
+            "CFBundleShortVersionString"
+        )
+        title, body = ms.about_text(version)
+        self._alert(title, body)
 
     @objc.python_method
     def _alert(self, message: str, informative: str) -> None:

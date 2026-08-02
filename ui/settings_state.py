@@ -402,8 +402,20 @@ def probe_image_server(
     chosen_pool = pool if pool in source_settings.VALID_POOLS else source_settings.DEFAULT_POOL
     root = base_url.strip().rstrip("/")
     query = "?starred=true" if chosen_pool == "starred" else ""
-    get = fetcher if fetcher is not None else _fetch_json
-    body = get(f"{root}/api/images{query}")
+    # 🔴 The Test button must ask the way the display asks. It did not:
+    # it fetched anonymously while the running source sent the appliance
+    # token, so a server holding 50 starred pictures answered the display
+    # with 50 and answered Test with 0 — reported as "Connected, but no
+    # starred pictures. Try 'All'." That is a confident, wrong diagnosis
+    # of someone else's server, and it sent a real user to go and look at
+    # Image Studio for a fault that was here.
+    from display import read_token as _read_token
+
+    auth = _read_token.listing_headers(root)
+    if fetcher is not None:
+        body = fetcher(f"{root}/api/images{query}")
+    else:
+        body = _fetch_json(f"{root}/api/images{query}", auth)
     if body is _UNREACHABLE:
         return TestResult(Outcome.UNREACHABLE, "Could not reach that address")
     if not isinstance(body, list):
@@ -412,6 +424,17 @@ def probe_image_server(
             "That address did not return a list of pictures",
         )
     if not body:
+        # An empty list with a credential in play is ambiguous, and saying
+        # otherwise is what caused the bug above: this server answers a
+        # rejected token with 200 and an empty list, which is
+        # indistinguishable from an empty library. Name both, credential
+        # first — the same wording rule the on-screen notice uses.
+        if auth:
+            return TestResult(
+                Outcome.NO_STARRED,
+                "Connected, but it sent nothing back. The access token may "
+                "have been rejected, or there may be no matching pictures.",
+            )
         if chosen_pool == "starred":
             return TestResult(
                 Outcome.NO_STARRED,
@@ -455,7 +478,7 @@ MAX_PROBE_BYTES = 2 * 1024 * 1024
 PROBE_TIMEOUT_S = 6.0
 
 
-def _fetch_json(url: str) -> object:
+def _fetch_json(url: str, extra_headers: dict | None = None) -> object:
     """GET `url` and decode it as JSON, through URL checks.
 
     Reuses `sources.net` rather than calling httpx directly, so the
@@ -478,6 +501,11 @@ def _fetch_json(url: str) -> object:
     if checked is None:
         return _UNREACHABLE
     headers = {"Host": checked.host_header} if checked.host_header else {}
+    # Only ever supplied by probe_image_server, and only for the listing
+    # call. The generic JSON-URL probe above passes nothing, so a
+    # user-typed list URL never receives a credential.
+    if extra_headers:
+        headers.update(extra_headers)
     try:
         with net.make_client(timeout_s=PROBE_TIMEOUT_S) as client:
             with client.stream(

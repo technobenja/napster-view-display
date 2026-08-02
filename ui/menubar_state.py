@@ -503,7 +503,63 @@ def command_refresh(command: Mapping[str, Any] | None) -> dict[str, Any]:
     return state
 
 
+#: Who made this. Kept here rather than in `menubar.py` so the About box
+#: is composed by a pure function and can be asserted in tests, like every
+#: other piece of user-facing text in this app.
+AUTHORS = ("Techno", "Opus")
+
+APP_NAME = "ImageView"
+
+ABOUT_SUMMARY = (
+    "Shows a rotating, circular-masked slideshow on a Napster View, "
+    "instead of the app it ships with."
+)
+
+#: The trademark line. This app drives someone else's hardware and says so
+#: everywhere else it is described; an About box that omitted it would be
+#: the one place the claim went missing.
+ABOUT_DISCLAIMER = (
+    "Not affiliated with, endorsed by, or connected to Napster or its "
+    "hardware partners. \u201cNapster\u201d and \u201cNapster View\u201d are "
+    "the trademarks of their respective owners."
+)
+
+
+def about_text(version: object) -> tuple[str, str]:
+    """`(title, body)` for the About box.
+
+    🔴 `version` is passed in, never hardcoded here. It comes from the
+    running bundle's `Info.plist`, so the About box cannot drift from the
+    thing the user actually installed — which is the same failure the
+    release gate's version-agreement check exists to catch, and it would
+    be absurd to reintroduce it in the one window whose entire job is to
+    state the version.
+
+    Degrades rather than raising: an unreadable version shows as unknown,
+    because an About box is never worth a crash.
+    """
+    if isinstance(version, str) and version.strip():
+        shown = version.strip()
+    else:
+        shown = "unknown version"
+    title = f"{APP_NAME} {shown}"
+    body = "\n\n".join(
+        (
+            ABOUT_SUMMARY,
+            "By " + " and ".join(AUTHORS) + ".",
+            ABOUT_DISCLAIMER,
+            "MIT licensed.",
+        )
+    )
+    return title, body
+
+
 __all__ = [
+    "ABOUT_DISCLAIMER",
+    "ABOUT_SUMMARY",
+    "APP_NAME",
+    "AUTHORS",
+    "about_text",
     "ELLIPSIS",
     "LABEL_MAX_CHARS",
     "STALE_AFTER_S",

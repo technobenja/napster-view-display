@@ -172,9 +172,7 @@ class ImageServerClient:
         token = self._config.read_token
         if not token:
             return {}
-        if not read_token.may_send_to(self._config.base_url):
-            return {}
-        return {read_token.READ_TOKEN_HEADER: token}
+        return read_token.listing_headers(self._config.base_url, token)
 
     def list_images(self) -> list[ImageRecord]:
         """`GET /api/images`, filtered to usable rows via `_is_usable`.

@@ -156,11 +156,34 @@ def may_send_to(base_url: str) -> bool:
     return True
 
 
+def listing_headers(base_url: str, token: str | None = None) -> dict[str, str]:
+    """Auth headers for a **listing** request to `base_url`, or `{}`.
+
+    The single decision point for "does the credential go out". It exists
+    because there was briefly more than one: `ImageServerClient` sent the
+    token and the Settings *Test* button did not, so the display showed 50
+    pictures while Test reported "Connected, but no starred pictures" —
+    two code paths asking the same server the same question and getting
+    different answers, which is worse than either answer alone.
+
+    Anything that lists images goes through here. Anything that fetches
+    image bytes must not.
+    """
+    if token is None:
+        token = load_read_token()
+    if not token:
+        return {}
+    if not may_send_to(base_url):
+        return {}
+    return {READ_TOKEN_HEADER: token}
+
+
 __all__ = [
     "KEYCHAIN_ACCOUNT",
     "KEYCHAIN_SERVICE",
     "READ_TOKEN_HEADER",
     "TOKEN_SHAPE_RE",
+    "listing_headers",
     "load_read_token",
     "may_send_to",
 ]

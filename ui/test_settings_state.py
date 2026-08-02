@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 from display import source_settings
@@ -500,3 +501,75 @@ class FormatTimestampTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestButtonAgreesWithTheDisplayTests(unittest.TestCase):
+    """🔴 The Test button must ask the server the way the display asks.
+
+    It did not. `probe_image_server` fetched anonymously while the running
+    source sent the appliance read token, so a server holding 50 starred
+    pictures answered the display with 50 and answered Test with 0 —
+    surfaced as "Connected, but no starred pictures. Try 'All'." while
+    those pictures were visibly rotating on the glass.
+
+    The cost of that is not a wrong string. It is a confident, wrong
+    diagnosis of *someone else's* system: it sent a real user to go and
+    ask the image server's maintainers about a fault that was here.
+    """
+
+    def test_the_probe_sends_the_credential_the_source_would_send(self):
+        from display import read_token
+
+        sent = {}
+
+        def fake_fetch(url, extra_headers=None):
+            sent["url"] = url
+            sent["headers"] = extra_headers or {}
+            return [{"id": "a", "filename": "a.png"}]
+
+        with mock.patch.object(read_token, "load_read_token", return_value="a" * 64), \
+             mock.patch.object(read_token, "may_send_to", return_value=True), \
+             mock.patch.object(ss, "_fetch_json", fake_fetch):
+            result = ss.probe_image_server("http://server.invalid:8883", "starred")
+
+        self.assertEqual(result.outcome, ss.Outcome.OK)
+        self.assertIn(read_token.READ_TOKEN_HEADER, sent["headers"])
+        self.assertEqual(sent["headers"][read_token.READ_TOKEN_HEADER], "a" * 64)
+
+    def test_no_credential_is_sent_when_the_destination_is_not_private(self):
+        from display import read_token
+
+        sent = {}
+
+        def fake_fetch(url, extra_headers=None):
+            sent["headers"] = extra_headers or {}
+            return [{"id": "a", "filename": "a.png"}]
+
+        with mock.patch.object(read_token, "load_read_token", return_value="a" * 64), \
+             mock.patch.object(read_token, "may_send_to", return_value=False), \
+             mock.patch.object(ss, "_fetch_json", fake_fetch):
+            ss.probe_image_server("https://public.example.com", "starred")
+
+        self.assertEqual(sent["headers"], {})
+
+    def test_empty_with_a_credential_does_not_blame_the_server(self):
+        """A rejected token answers 200 with an empty list here, which is
+        indistinguishable from an empty library. Do not pick one."""
+        from display import read_token
+
+        with mock.patch.object(read_token, "load_read_token", return_value="a" * 64), \
+             mock.patch.object(read_token, "may_send_to", return_value=True), \
+             mock.patch.object(ss, "_fetch_json", lambda u, h=None: []):
+            result = ss.probe_image_server("http://server.invalid:8883", "starred")
+
+        self.assertIn("token", result.message.lower())
+        self.assertNotIn("no starred pictures", result.message.lower())
+
+    def test_empty_without_a_credential_keeps_the_original_advice(self):
+        from display import read_token
+
+        with mock.patch.object(read_token, "load_read_token", return_value=None), \
+             mock.patch.object(ss, "_fetch_json", lambda u, h=None: []):
+            result = ss.probe_image_server("http://server.invalid:8883", "starred")
+
+        self.assertEqual(result.message, "Connected, but no starred pictures. Try 'All'.")
