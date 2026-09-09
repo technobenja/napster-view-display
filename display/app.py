@@ -60,37 +60,39 @@ STATUS_PATH = paths.status_path()
 # interactively, where launchd is not redirecting stdout/stderr to these
 # paths at all.
 #
-# ** KNOWN DEFECT, and the comment that used to be here described the
-# opposite state. ** It said these paths and the plist's
-# StandardOutPath/StandardErrorPath did not match — the installed plist
-# still pointed at <repo>/display/logs/ — and concluded that "the only
-# cost is that log rotation is inert for the launchd-managed run". That
-# was true when it was written and is no longer: the installer generates
-# the plists from paths.py, so StandardErrorPath and stderr_log_path()
-# are now the SAME FILE. The comment had become an instruction to ignore
-# a live hazard.
+# ** THESE PATHS AND THE PLIST'S StandardOutPath/StandardErrorPath ARE
+# THE SAME FILES. ** The installer generates the plists from paths.py, so
+# stderr_log_path() and StandardErrorPath resolve identically. Two
+# earlier versions of this comment got that relationship wrong in
+# opposite directions, so it is stated plainly rather than implied.
 #
-# The hazard: launchd opens StandardErrorPath BEFORE exec'ing this
-# process, so fd 2 is already that file by the time main() runs.
-# rotate_if_oversized renames — it does not truncate — so once the log
-# is over MAX_LOG_BYTES, the next start renames the very inode launchd
-# is holding open. Everything this process then writes goes to
-# `.old`, while the path every doc, runbook and support answer names
-# sits empty. It is silent, it looks exactly like "the agent stopped
-# logging", and it recurs on every subsequent start.
+# That identity used to make rotation a live defect, now FIXED in
+# log_rotation.py. The hazard was: launchd opens StandardErrorPath and
+# dups it onto fd 2 BEFORE exec'ing this process, so fd 2 already IS
+# that file by the time main() runs — and rotate_if_oversized used to
+# RENAME. A rename moves the very inode launchd is holding, so
+# everything this process then wrote went to `.old` while the path every
+# doc, runbook and support answer names sat empty. Silent, indis-
+# tinguishable from "the agent stopped logging", and recurring on every
+# subsequent start. It fired for real: display.stderr.log reached
+# 12,181,049 bytes against a 10 MB cap with no `.old`, and was moved
+# aside by hand as a v1.1.3 deployment step. That manual step is what
+# the fix removes.
 #
-# Not fixed here, and moving the calls below the single-instance guard
-# would NOT fix it: this is the single-process case, and the fd is
-# already inherited whether or not anyone else is contending. A process
-# cannot safely rotate a path launchd opened on its behalf at all. The
-# real fixes are design choices with their own tradeoffs — let launchd's
-# fd be the only writer and rotate from outside the process, or have the
-# app own its log the way diagnostics.redirect_stderr_to_log() does for
-# the menu bar and leave StandardErrorPath pointed somewhere else. Both
-# are out of scope for an observability phase.
+# rotate_if_oversized now COPIES to `.old` and truncates the original
+# IN PLACE, so the inode — and therefore launchd's descriptor — survives
+# rotation. The correctness of that rests on launchd opening these paths
+# with O_APPEND, which was MEASURED rather than assumed; the evidence and
+# the method are in log_rotation.py's module docstring. Re-measure it
+# before trusting it on a future macOS.
 #
-# display/diagnostics.py states the general rule this violates: rotate a
-# file only from the process that has proven it is the sole writer.
+# What is still true: moving these calls below the single-instance guard
+# would fix nothing, because the descriptor is inherited whether or not
+# anyone is contending. And the general rule in display/diagnostics.py
+# still holds — rotate a file only from the process that has proven it
+# is the sole writer — because copy-truncate makes the descriptor safe,
+# not the CONTENT: a second process rotating this path would now zero the
+# first process's log in place instead of moving it aside.
 LOG_DIR = paths.log_dir()
 STDOUT_LOG_PATH = paths.stdout_log_path()
 STDERR_LOG_PATH = paths.stderr_log_path()
@@ -1303,7 +1305,8 @@ def main() -> None:
     # real logging happens - deliberately ahead of even the first print()
     # below, since that print is itself the first byte that could push a
     # long-lived log past its cap on this run. See log_rotation.py for why
-    # rotate-and-keep-one-old-generation was chosen over truncate-in-place.
+    # copy-then-truncate-in-place is the only shape of rotation that a
+    # descriptor launchd opened before exec can survive.
     rotate_if_oversized(STDOUT_LOG_PATH)
     rotate_if_oversized(STDERR_LOG_PATH)
 

@@ -62,10 +62,20 @@ wrote it.
    away the ability to *stop* the service.
 
 2. **Rotate a file only from the process that has proven it is the sole
-   writer.** Rotation is rename-and-recreate, so a second process that
-   rotates a log a first process already has open does not truncate it —
-   it moves it out from under the writer's file descriptor, silently,
-   for the rest of that process's life. `arm_stack_dumps()` is therefore
+   writer.** Rotation is copy-then-truncate-in-place (`log_rotation.py`).
+   It used to be rename-and-recreate, which moved the file out from under
+   the writer's descriptor and sent everything it wrote thereafter to
+   `.old`; that is fixed, and the descriptor now survives rotation.
+   **The rule survives the fix, but the harm it guards against is
+   smaller and must be stated accurately.** A second process that
+   rotates a log a first process already has open now empties it in
+   place. That is *strictly better* than the rename failure, not equal
+   to it: retention is unchanged (`.old` is one complete generation
+   either way) and the writer's own descriptor keeps landing in the
+   right file instead of an orphan. What is still wrong is real and
+   enough on its own — the file everyone reads is emptied by a process
+   with no right to touch it, and the prior `.old` generation it
+   overwrote is gone. `arm_stack_dumps()` is therefore
    called only *after* `single_instance.acquire()` has returned a
    handle, and `redirect_stderr_to_log()` does not rotate at all: its
    whole reason for existing is the double-click-while-already-running
@@ -90,9 +100,13 @@ wrote it.
 
 - `<role>.stderr.log` has no rotator, and `redirect_stderr_to_log()`
   adds a writer to it. Growth is human-paced — a few lines per launch —
-  but it is unbounded, and the reason nothing rotates it is the
-  fd-under-launchd hazard above rather than a decision that it should
-  grow forever.
+  but it is unbounded. The reason nothing rotates it **used** to be the
+  fd-under-launchd hazard, and that specific hazard is gone: copy-
+  truncate rotation is safe to point at a descriptor launchd opened. What
+  remains is the two-writer hazard in rule 2 — this is the one log with
+  a second, in-process writer — plus the plain fact that nobody has
+  measured a need. Adding a rotator here is now a small change rather
+  than a blocked one; it is still a change, and it is not this one.
 - `role` reaches a filesystem path with no validation. Latent only:
   every caller passes one of the two module constants in `paths`, and
   `ui_agent.build_plist` takes `.name` off the result, which would
@@ -238,16 +252,21 @@ def redirect_stderr_to_log(role: str) -> Path | None:
 
     **This function does not rotate.** Every other log in this app is
     rotated at startup (`log_rotation.py`), and the omission here is
-    considered, not forgotten. Rotation renames; it does not truncate. The
-    case this redirect exists for is a double-click while the app is
-    already running, where the calling process is *by definition* the one
-    about to lose the single-instance race — and a rename issued by that
-    loser would move the surviving instance's log out from under an fd
-    launchd (or the winner) is still writing to, leaving the live log in
-    `.old` and a one-line file at the real path. The growth rotation was
-    written for is the display agent's per-poll output over months; the
-    menu bar writes a handful of lines per launch, so bounding it is not
-    worth that.
+    considered, not forgotten. Rotation copies the file aside and then
+    truncates it in place. The case this redirect exists for is a
+    double-click while the app is already running, where the calling
+    process is *by definition* the one about to lose the single-instance
+    race — and a truncate issued by that loser would empty the surviving
+    instance's log while launchd (or the winner) is still writing to it,
+    and would spend the single `.old` generation on the loser's timing
+    rather than the winner's restart. Less damaging than the rename it
+    replaced — the winner's descriptor keeps working and one complete
+    generation is still retained — but it is still a process with no
+    claim on the file deciding when the file everyone reads gets
+    emptied. The growth rotation was written for
+    is the display agent's per-poll output over months; the menu bar
+    writes a handful of lines per launch, so bounding it is not worth
+    that.
 
     Only `sys.stderr` is replaced — fd 2 itself is untouched. An
     in-process replacement is reversible and cannot disturb a descriptor
@@ -316,8 +335,8 @@ def arm_stack_dumps(role: str) -> Path | None:
     surrounding log lines.
 
     **Call this only after the single-instance lock is won.** It rotates
-    the file, and rotation from a losing instance would move a running
-    instance's dumps out from under it — see this module's docstring.
+    the file, and rotation from a losing instance would zero a running
+    instance's accumulated dumps in place — see this module's docstring.
     """
     global _dump_file
 

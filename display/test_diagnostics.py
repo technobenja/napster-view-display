@@ -393,13 +393,18 @@ class MenubarContentionTests(unittest.TestCase):
     def test_a_losing_menu_bar_does_not_rotate_the_holder_s_stacks_log(self) -> None:
         """The ordering rule, as behaviour rather than as a comment.
 
-        Rotation renames; it does not truncate. A losing instance that
-        rotated `ui.stacks.log` would move the *holder's* dump file out
-        from under the descriptor `faulthandler` is still pointed at —
-        so every stack dump from the process anyone is actually trying to
-        diagnose would land in `.old`, while the file every instruction
-        names sat empty. Arming therefore happens after the guard, and
-        this is what says so."""
+        Rotation copies aside and then truncates in place. A losing
+        instance that rotated `ui.stacks.log` would zero the *holder's*
+        dump file under the descriptor `faulthandler` is still pointed
+        at — so every dump the holder had already written, from the
+        process anyone is actually trying to diagnose, would be gone from
+        the file every instruction names. (Before the copy-truncate fix
+        the same mistake *renamed* that file instead, which broke the
+        descriptor outright; the ordering rule predates the fix and
+        outlives it.) Arming therefore happens after the guard, and this
+        is what says so. The size assertion below is the load-bearing
+        one now: `.old` not existing and the size being unchanged were
+        one fact under rename and are two under copy-truncate."""
         stacks = self.home / "Library" / "Logs" / "ImageView" / "ui.stacks.log"
         stacks.parent.mkdir(parents=True)
         # Comfortably over log_rotation.MAX_LOG_BYTES, so an
