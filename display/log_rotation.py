@@ -4,9 +4,9 @@ a fixed size, checked at each RunAtLoad)."
 `launchd` itself does not rotate `StandardOutPath`/`StandardErrorPath` —
 it just opens them (append mode, matching normal shell-redirect
 semantics) and leaves growth entirely up to whatever's writing. This app
-runs unattended indefinitely on a machine that's also the household's
-primary AI orchestration node, so an unbounded log over months of uptime
-is a real disk-hygiene problem, not a hypothetical one.
+runs unattended indefinitely, often for months at a stretch, so an
+unbounded log is a real disk-hygiene problem rather than a hypothetical
+one.
 
 This module is called once, at process startup, before any real logging
 happens (see `app.py`'s `main()`) — matching the granularity the run loop

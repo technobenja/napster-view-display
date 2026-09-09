@@ -112,7 +112,7 @@ def build_plist(
     app: Path = INSTALLED_APP,
     *,
     args: tuple[str, ...] = (),
-    log_prefix: str = "ui",
+    log_prefix: str = paths.UI_ROLE,
     log_dir: Path | None = None,
 ) -> dict[str, object]:
     """The LaunchAgent definition, as a plain dict `plistlib` can dump.
@@ -149,8 +149,17 @@ def build_plist(
         # out with a clean exit, actually stays stopped.
         "KeepAlive": {"SuccessfulExit": False},
         "ThrottleInterval": THROTTLE_INTERVAL_S,
-        "StandardOutPath": str(logs / f"{log_prefix}.stdout.log"),
-        "StandardErrorPath": str(logs / f"{log_prefix}.stderr.log"),
+        # Basenames come from `paths`, not from an f-string here.
+        # `log_prefix` is the role (`paths.UI_ROLE` / `DISPLAY_ROLE`),
+        # and the app now opens `<role>.stderr.log` for itself when
+        # launchd did not (`diagnostics.redirect_stderr_to_log`). Two
+        # independent spellings of one filename is a bad trade: the one
+        # that drifts does not error, it just writes somewhere else, and
+        # both halves keep reporting success. `logs` stays injectable so
+        # the plist contents remain testable without touching
+        # `~/Library/Logs/`.
+        "StandardOutPath": str(logs / paths.stdout_log_path(log_prefix).name),
+        "StandardErrorPath": str(logs / paths.stderr_log_path(log_prefix).name),
         "ProcessType": "Interactive",
     }
 
@@ -291,7 +300,7 @@ def install(
     app: Path = INSTALLED_APP,
     *,
     args: tuple[str, ...] = (),
-    log_prefix: str = "ui",
+    log_prefix: str = paths.UI_ROLE,
 ) -> bool:
     """Write the plist and (re)load it. Safe to run repeatedly.
 
@@ -336,7 +345,7 @@ def install_display(app: Path = INSTALLED_APP) -> bool:
         paths.DISPLAY_AGENT_LABEL,
         app,
         args=("--display",),
-        log_prefix="display",
+        log_prefix=paths.DISPLAY_ROLE,
     )
 
 

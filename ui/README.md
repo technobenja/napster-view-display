@@ -1,11 +1,16 @@
 # The menu bar — installing, quitting, rebuilding, removing
 
-The menu bar is `ImageView.app`. It is a real installed application in
-`/Applications`, and a LaunchAgent (`dev.viewlab.imageview.ui`) starts it
-at login so it survives logout, reboot, and closing the Terminal that
-happened to launch it. Before this, it ran as
-`display/.venv/bin/python3 ui/menubar.py` from an interactive shell and
-died with the session.
+The menu bar is `ImageView.app`, a real installed application in
+`/Applications`.
+
+**Scope: this document describes a source-tree install**, where the menu
+bar's own LaunchAgent (`dev.viewlab.imageview.ui`) was installed by hand
+with `ui/ui_agent.py install`. **A `.dmg` install does not have it** —
+the app installs an agent for the *display* only, and the menu bar is
+started by opening the app. So every `launchctl ... dev.viewlab.imageview.ui`
+command below applies only if you installed that agent yourself; on a
+`.dmg` install it answers `No such process`, which is correct and not a
+fault.
 
 It is a **separate process from the display agent** and neither can take
 the other down. Force-quit the menu bar and the pictures keep rotating.
@@ -58,6 +63,12 @@ flash or highlight the existing status item before exiting, which needs a
 channel between the two UI processes that does not exist yet. Being told
 "already running" in an alert would be worse: it is noise attached to a
 non-problem.
+
+It is no longer *silent*, though: the second instance writes the reason —
+which lock, which pid holds it, and that exiting 0 was deliberate — to
+`ui.stderr.log` before it goes. That matters when the status item is
+**not** already there, because then the holder is stuck rather than
+healthy, and "the app will not launch" is the only symptom you get.
 
 The display agent has its own separate lock (`~/.viewlab/display.lock`).
 The two never contend.
@@ -201,13 +212,14 @@ Left behind on purpose, because they are yours and not the app's:
 - `~/.viewlab/` — `calibration.json` is hand-measured and is read by
   other tools, so nothing deletes it for you. `ui.lock` lives here too
   and is harmless.
-- `~/Library/Logs/ImageView/` — `ui.stdout.log`, `ui.stderr.log`.
+- `~/Library/Logs/ImageView/` — `ui.stdout.log`, `ui.stderr.log`,
+  `ui.stacks.log`.
 - `~/Library/Caches/dev.viewlab.imageview/` — downloaded images.
   Regenerable; delete freely.
 
-Removing the app does **not** touch the display agent. That is still the
-pre-existing a pre-existing source-tree LaunchAgent label LaunchAgent running from the
-source tree, and it is deliberately out of scope here.
+Removing the app does **not** touch the display agent. It has its own
+LaunchAgent and keeps running; removing that is deliberately out of scope
+here.
 
 ## Where things are
 
@@ -216,7 +228,7 @@ source tree, and it is deliberately out of scope here.
 | The app | `/Applications/ImageView.app` |
 | Its executable | `Contents/MacOS/ImageView` (no args = menu bar, `--display` = display agent) |
 | LaunchAgent plist | `~/Library/LaunchAgents/dev.viewlab.imageview.ui.plist` |
-| Logs | `~/Library/Logs/ImageView/ui.{stdout,stderr}.log` |
+| Logs | `~/Library/Logs/ImageView/ui.{stdout,stderr,stacks}.log` |
 | Instance lock | `~/.viewlab/ui.lock` |
 | Menu bar icon | `Contents/Resources/menubar-template.pdf` (inside the bundle, not the source tree) |
 
@@ -229,3 +241,47 @@ launchctl print gui/$(id -u)/dev.viewlab.imageview.ui
 The useful lines are `state`, `pid`, and `last exit code`. A `state = not
 running` with `last exit code = 0` is the normal, healthy state after you
 chose Quit — not a failure.
+
+If it is running but not responding — the icon is missing, or the menu
+does not open, or Quit does nothing while Force Quit works — ask it where
+it is stuck **before** killing it, because a Force Quit leaves no trace at
+all:
+
+**Check first that this build arms stack dumps.** They exist from
+**v1.1.3** onward, and only once the app has started successfully. With
+no handler installed, `SIGUSR1`'s default action is to **terminate the
+process** — so on an older build this kills the very thing you were
+being careful not to lose.
+
+```sh
+grep 'kill -USR1' ~/Library/Logs/ImageView/ui.stderr.log
+```
+
+If that names a pid and a path, dumps are armed. If it prints nothing,
+**stop** — do not send the signal.
+
+```sh
+kill -USR1 $(pgrep -f 'ImageView$')
+cat ~/Library/Logs/ImageView/ui.stacks.log
+```
+
+That dumps every thread's Python stack, and it works on a process too
+stuck to run any Python of its own.
+
+The display agent answers the same signal, into `display.stacks.log`.
+`pgrep -f 'ImageView$'` deliberately matches the menu bar only, because
+the display agent's command line ends in `--display` — so reach it with:
+
+```sh
+kill -USR1 $(pgrep -f 'ImageView --display')
+```
+
+**Read these before you share them.** A stack dump lists absolute source
+paths, and `ui.stderr.log` records the absolute path of the instance
+lock, so both contain your account name and something of your directory
+layout. That is fine in a bug report you are happy to attach; check them
+first if you are pasting into a public issue.
+
+If a log is unexpectedly *empty*, look beside it for a `.old` — a known
+rotation defect can move the live log there at startup, and everything
+the running process writes goes to the `.old` copy.

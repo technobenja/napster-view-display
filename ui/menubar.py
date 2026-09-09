@@ -45,7 +45,7 @@ from pathlib import Path
 import AppKit
 import objc
 
-from display import control, paths, single_instance
+from display import control, diagnostics, paths, single_instance
 from display.config_store import read_json_object
 from ui import first_run_state as fr
 from ui import menubar_state as ms
@@ -778,9 +778,58 @@ def main() -> int:
     command/status files are the UI-to-display channel and giving them
     UI-to-UI traffic would blur the separation. Recorded as a known
     rough edge in `ui/README.md` rather than papered over.
+
+    What *has* changed is that the exit is no longer silent to anyone
+    reading afterwards: the stderr redirect is taken before the guard
+    runs, so the reason survives the process even on a Finder launch,
+    where until now it went to a stderr that macOS discards. Nothing
+    visible to the user has changed. See `display/diagnostics.py`.
     """
-    if single_instance.acquire(paths.ui_lock_path(), "menu bar process") is None:
+    # Before the guard, deliberately: the guard's decision is the first
+    # thing worth recording, and until this runs a Finder-launched menu
+    # bar has nowhere at all to record it. Does nothing when the UI
+    # LaunchAgent already pointed stderr at this file.
+    stderr_log = diagnostics.redirect_stderr_to_log(paths.UI_ROLE)
+    diagnostics.note(f"menubar: pid {os.getpid()} starting.")
+    if stderr_log is not None:
+        diagnostics.note(f"menubar: stderr redirected to {stderr_log}.")
+
+    ui_lock = paths.ui_lock_path()
+    if single_instance.acquire(ui_lock, "menu bar process") is None:
+        # `read_holder_pid` was documentation-only until now and stays
+        # so: this is still only a message, and a pid can be stale or
+        # reused. Making it load-bearing is Phase 3's job and needs the
+        # executable-path check that goes with it.
+        holder = single_instance.read_holder_pid(ui_lock)
+        holder_text = f"pid {holder}" if holder is not None else "an unknown pid"
+        advice = (
+            f"`kill -USR1 {holder}` dumps its stacks before you kill it"
+            if holder is not None
+            else "the lock file names no pid, so start from `pgrep -fl ImageView`"
+        )
+        # Interpolates strs and a Path only, so the f-string itself
+        # cannot raise — `note()` cannot protect a caller's formatting.
+        diagnostics.note(
+            f"menubar: exiting 0 deliberately — {holder_text} already holds "
+            f"{ui_lock}, so the status item is already in the menu bar. If it "
+            f"is NOT, that process is wedged while holding the lock: {advice}."
+        )
         return 0
+
+    # Only now, after `acquire()` returned a handle, is this process
+    # entitled to rotate `ui.stacks.log` — and arming rotates it. See the
+    # rotation rule in `diagnostics.py`. Note what this does and does not
+    # establish: `acquire()` also returns a handle from its `_no_guard()`
+    # sentinel, when the lock file could not be created at all, and no
+    # caller can tell the two apart. Under that sentinel the sole-writer
+    # property degrades along with the guard itself — accepted here, and
+    # named in `diagnostics.py` rather than left as an implication.
+    stacks_log = diagnostics.arm_stack_dumps(paths.UI_ROLE)
+    if stacks_log is not None:
+        diagnostics.note(
+            f"menubar: kill -USR1 {os.getpid()} dumps all thread stacks "
+            f"to {stacks_log}."
+        )
 
     app = AppKit.NSApplication.sharedApplication()
     # No Dock icon, no menu bar menus -- this app *is* a status item.

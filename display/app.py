@@ -17,6 +17,7 @@ Screen Sharing with control.
 from __future__ import annotations
 
 import json
+import os
 import sys
 import time
 import traceback
@@ -25,6 +26,7 @@ import AppKit
 import objc
 
 from display import control
+from display import diagnostics
 from display import notice
 from display import paths
 from display import single_instance
@@ -55,21 +57,40 @@ STATUS_PATH = paths.status_path()
 
 # These are checked and rotated (log_rotation.py) before this process
 # does any real logging of its own. Rotating them is a no-op when run
-# interactively (nothing here yet, since launchd isn't redirecting
-# stdout/stderr to these paths in that case) - safe to call
-# unconditionally either way.
+# interactively, where launchd is not redirecting stdout/stderr to these
+# paths at all.
 #
-# ** KNOWN MISMATCH, deliberately not fixed in Step -1. ** These must
-# match the LaunchAgent plist's StandardOutPath/StandardErrorPath, and as
-# of Step -1 they no longer do: the installed plist still redirects to
-# <repo>/display/logs/, so rotation currently runs against files launchd
-# is not writing. Left alone on purpose, because launchd does NOT create
-# intermediate directories for those keys - a plist pointing at
-# ~/Library/Logs/ImageView/ before that directory exists makes the job
-# fail to spawn at all, and paths.ensure_all() below runs far too late to
-# help. The installer generates the plists at install time (Step 5b), which is
-# where directory creation and this path belong together. Until then the
-# only cost is that log rotation is inert for the launchd-managed run.
+# ** KNOWN DEFECT, and the comment that used to be here described the
+# opposite state. ** It said these paths and the plist's
+# StandardOutPath/StandardErrorPath did not match — the installed plist
+# still pointed at <repo>/display/logs/ — and concluded that "the only
+# cost is that log rotation is inert for the launchd-managed run". That
+# was true when it was written and is no longer: the installer generates
+# the plists from paths.py, so StandardErrorPath and stderr_log_path()
+# are now the SAME FILE. The comment had become an instruction to ignore
+# a live hazard.
+#
+# The hazard: launchd opens StandardErrorPath BEFORE exec'ing this
+# process, so fd 2 is already that file by the time main() runs.
+# rotate_if_oversized renames — it does not truncate — so once the log
+# is over MAX_LOG_BYTES, the next start renames the very inode launchd
+# is holding open. Everything this process then writes goes to
+# `.old`, while the path every doc, runbook and support answer names
+# sits empty. It is silent, it looks exactly like "the agent stopped
+# logging", and it recurs on every subsequent start.
+#
+# Not fixed here, and moving the calls below the single-instance guard
+# would NOT fix it: this is the single-process case, and the fd is
+# already inherited whether or not anyone else is contending. A process
+# cannot safely rotate a path launchd opened on its behalf at all. The
+# real fixes are design choices with their own tradeoffs — let launchd's
+# fd be the only writer and rotate from outside the process, or have the
+# app own its log the way diagnostics.redirect_stderr_to_log() does for
+# the menu bar and leave StandardErrorPath pointed somewhere else. Both
+# are out of scope for an observability phase.
+#
+# display/diagnostics.py states the general rule this violates: rotate a
+# file only from the process that has proven it is the sole writer.
 LOG_DIR = paths.log_dir()
 STDOUT_LOG_PATH = paths.stdout_log_path()
 STDERR_LOG_PATH = paths.stderr_log_path()
@@ -1296,6 +1317,28 @@ def main() -> None:
     if single_instance.acquire(paths.lock_path()) is None:
         print("view-lab app.py exiting cleanly (another instance is running).", file=sys.stderr)
         sys.exit(0)
+
+    # `kill -USR1 <pid>` now dumps every thread's Python stack to
+    # <role>.stacks.log. Armed here and not earlier because arming
+    # rotates that file, and only an instance for which `acquire()`
+    # returned a handle is entitled to; see the rotation rule in
+    # diagnostics.py, which also names what that does not cover — the
+    # `_no_guard()` sentinel is a handle without a lock.
+    #
+    # This agent already has a log, so unlike the menu bar it does not
+    # redirect stderr — launchd's StandardErrorPath owns it, and running
+    # `./.venv/bin/python3 app.py` interactively is a documented
+    # workflow whose output belongs on the terminal. Only the dump file
+    # is new here. It is armed on both halves of the app because both
+    # run the same AppKit run loop, and a run loop that stops servicing
+    # timers is exactly the state no Python-level handler can report —
+    # the same fact SIGNAL_RESPONSIVENESS_INTERVAL_S exists for.
+    stacks_log = diagnostics.arm_stack_dumps(paths.DISPLAY_ROLE)
+    if stacks_log is not None:
+        print(
+            f"  stack dumps: kill -USR1 {os.getpid()} -> {stacks_log}",
+            file=sys.stderr,
+        )
 
     calibration_resolved = load_calibration_resolved()
     settings_resolved = load_settings_resolved()

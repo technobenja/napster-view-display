@@ -56,7 +56,7 @@ shasum -a 256 ~/Downloads/ImageView.dmg
 ```
 
 ```
-SHA-256 (ImageView.dmg) = 20f05ae906e8d448a5d15651746524960d672ea3027396ae547d73e2e3fb582a
+SHA-256 (ImageView.dmg) = df2dc743d11f10125a5776500fa8f688dd99324b3dadde60b6f08f0a4a1b39ed
 ```
 
 If that does not match, do not open it.
@@ -159,7 +159,7 @@ packaging/make_release.sh
 ```
 
 This builds `ImageView.app` and `ImageView.dmg` from a clean, tracked-files-only
-checkout at a neutral path. It refuses to produce a `.dmg` if any of its six
+checkout at a neutral path. It refuses to produce a `.dmg` if any of its seven
 gates fail — including identity sweeps over both the finished bundle *and* the
 `.dmg` itself, which read inside binary `.pyc` files, compressed zip members
 and the mounted disk image, where an ordinary `grep -r` sees nothing.

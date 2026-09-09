@@ -88,6 +88,21 @@ class BuildPlistTests(unittest.TestCase):
         the display agent instead, on a label that says `.ui`."""
         self.assertEqual(len(self.data["ProgramArguments"]), 1)
 
+    def test_the_default_role_is_the_menu_bar_s_own_log_files(self) -> None:
+        """`log_prefix` defaults to the UI role, and this pins it.
+
+        The default was previously the bare literal `"ui"` while
+        `menubar.main()` asked `paths` for the same name — two spellings,
+        with only this plist's half unpinned, so changing one of them
+        broke nothing that anyone would notice until the menu bar was
+        writing to a file the LaunchAgent had never heard of."""
+        self.assertEqual(
+            self.data["StandardErrorPath"], str(paths.stderr_log_path(paths.UI_ROLE))
+        )
+        self.assertEqual(
+            self.data["StandardOutPath"], str(paths.stdout_log_path(paths.UI_ROLE))
+        )
+
 
 class DisplayPlistTests(unittest.TestCase):
     """The display-agent plist — the piece v1.0.0 shipped without, so a
@@ -134,7 +149,7 @@ class DisplayPlistTests(unittest.TestCase):
             self.assertTrue(ui_agent.install_display(Path("/Applications/ImageView.app")))
         self.assertEqual(captured["label"], paths.DISPLAY_AGENT_LABEL)
         self.assertEqual(captured["args"], ("--display",))
-        self.assertEqual(captured["log_prefix"], "display")
+        self.assertEqual(captured["log_prefix"], paths.DISPLAY_ROLE)
 
     def test_open_dash_a_is_not_used(self) -> None:
         """The packaging rules it out: it returns immediately, so launchd sees a
@@ -167,6 +182,22 @@ class DisplayPlistTests(unittest.TestCase):
                 self.data[key].startswith(str(paths.log_dir())),
                 f"{key} = {self.data[key]}",
             )
+
+    def test_the_plist_names_the_same_file_the_app_opens_for_itself(self) -> None:
+        """The menu bar now opens `<role>.stderr.log` for itself whenever
+        launchd did not (`diagnostics.redirect_stderr_to_log`). If these
+        two spellings ever diverge the app does not error — it quietly
+        writes somewhere nobody is looking, and both halves go on
+        reporting success."""
+        for role in (paths.UI_ROLE, paths.DISPLAY_ROLE):
+            with self.subTest(role=role):
+                data = ui_agent.build_plist(paths.UI_AGENT_LABEL, self.app, log_prefix=role)
+                self.assertEqual(
+                    data["StandardErrorPath"], str(paths.stderr_log_path(role))
+                )
+                self.assertEqual(
+                    data["StandardOutPath"], str(paths.stdout_log_path(role))
+                )
 
     def test_no_working_directory(self) -> None:
         """Nothing in the bundle resolves paths relative to cwd — every

@@ -106,8 +106,26 @@ UI_AGENT_LABEL = f"{BUNDLE_ID}.ui"
 #: `Contents/Resources/` in the bundle — see `menubar_template_path()`.
 MENUBAR_TEMPLATE_FILENAME = "menubar-template.pdf"
 
-STDOUT_LOG_FILENAME = "display.stdout.log"
-STDERR_LOG_FILENAME = "display.stderr.log"
+#: Log basenames are `<role>.stdout.log` / `<role>.stderr.log`, where the
+#: role is the argv the single executable was dispatched on: `--display`
+#: is the display agent, no args is the menu bar. Derived from the role
+#: rather than spelled out once per role because `ui_agent.build_plist()`
+#: names the same two files in the LaunchAgent's `StandardOutPath` /
+#: `StandardErrorPath`, and `diagnostics.redirect_stderr_to_log()` opens
+#: one of them itself when launchd did not — so the file the app writes
+#: and the file launchd opens for it can only ever be the same file.
+#: They were two independent f-strings until this was added. A second
+#: code path answering the same question does not fail loudly when it
+#: drifts — it just writes somewhere nobody is looking, and keeps
+#: reporting success.
+DISPLAY_ROLE = "display"
+UI_ROLE = "ui"
+
+#: Written by `faulthandler` on SIGUSR1 — see `display/diagnostics.py`.
+#: A file of its own rather than the stderr log because in the
+#: LaunchAgent case launchd owns `<role>.stderr.log`, and a second,
+#: independent writer on it is what this project's file contract forbids.
+STACKS_LOG_SUFFIX = ".stacks.log"
 
 
 # -- the five roots ----------------------------------------------------
@@ -263,12 +281,23 @@ def ui_lock_path() -> Path:
     return config_dir() / UI_LOCK_FILENAME
 
 
-def stdout_log_path() -> Path:
-    return log_dir() / STDOUT_LOG_FILENAME
+def stdout_log_path(role: str = DISPLAY_ROLE) -> Path:
+    """`~/Library/Logs/ImageView/<role>.stdout.log`. Defaults to the
+    display agent's, which is the only caller that predates roles."""
+    return log_dir() / f"{role}.stdout.log"
 
 
-def stderr_log_path() -> Path:
-    return log_dir() / STDERR_LOG_FILENAME
+def stderr_log_path(role: str = DISPLAY_ROLE) -> Path:
+    """`~/Library/Logs/ImageView/<role>.stderr.log`."""
+    return log_dir() / f"{role}.stderr.log"
+
+
+def stacks_log_path(role: str) -> Path:
+    """`~/Library/Logs/ImageView/<role>.stacks.log` — where `kill -USR1`
+    puts this process's thread stacks. No default: a dump filed under the
+    wrong process is worse than no dump, so the caller has to say which
+    half of the app it is."""
+    return log_dir() / f"{role}{STACKS_LOG_SUFFIX}"
 
 
 # -- creation ----------------------------------------------------------

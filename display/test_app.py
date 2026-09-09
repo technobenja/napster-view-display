@@ -756,6 +756,94 @@ class SingleInstanceStartupTests(unittest.TestCase):
         mock_acquire.assert_called_once_with(app.paths.lock_path())
 
 
+def _resolved_calibration() -> Mock:
+    """Startup logs the resolved values, so these have to format."""
+    return Mock(
+        value=Mock(center_x=483.0, center_y=482.0, effective_radius_px=438.96),
+        source=app.ConfigSource.USER,
+        path=Path("/tmp/calibration.json"),
+    )
+
+
+def _resolved_settings() -> Mock:
+    return Mock(
+        value=Mock(
+            rotation_interval_s=900.0,
+            poll_interval_s=1800.0,
+            fade_duration_s=2.0,
+            pool="starred",
+        ),
+        source=app.ConfigSource.USER,
+        path=Path("/tmp/settings.json"),
+    )
+
+
+class StackDumpArmingTests(unittest.TestCase):
+    """`kill -USR1` is only useful if main() actually arms it — and only
+    safe if it arms *after* the guard.
+
+    Arming rotates `display.stacks.log`. Rotation renames rather than
+    truncates, so an instance that armed before the guard and then lost
+    it would have moved the winner's dump file out from under the
+    descriptor faulthandler is pointed at: every later dump from the
+    process anyone wants to diagnose would land in `.old`.
+    """
+
+    def _run_main(self, acquired: object) -> list[str]:
+        """Run the real `main()` past the guard, recording the order of
+        the two calls that matter. Everything with a side effect outside
+        the process is mocked; `Path.home()` is never reached because
+        `arm_stack_dumps` itself is replaced."""
+        order: list[str] = []
+
+        def fake_acquire(*_args, **_kwargs):
+            order.append("acquire")
+            return acquired
+
+        def fake_arm(role):
+            order.append(f"arm:{role}")
+            return None
+
+        with patch.object(app.paths, "ensure_all"), patch.object(
+            app, "rotate_if_oversized"
+        ), patch.object(
+            app.single_instance, "acquire", side_effect=fake_acquire
+        ), patch.object(
+            app.diagnostics, "arm_stack_dumps", side_effect=fake_arm
+        ), patch.object(
+            app, "load_calibration_resolved", return_value=_resolved_calibration()
+        ), patch.object(
+            app, "load_settings_resolved", return_value=_resolved_settings()
+        ), patch.object(
+            app, "merge_status"
+        ), patch.object(
+            app, "install_signal_handlers"
+        ), patch.object(
+            app, "Bootstrapper"
+        ), patch.object(
+            app.AppKit, "NSApplication"
+        ), patch.object(
+            app.AppKit, "NSTimer"
+        ):
+            if acquired is None:
+                with self.assertRaises(SystemExit) as caught:
+                    app.main()
+                self.assertEqual(caught.exception.code, 0)
+            else:
+                app.main()
+        return order
+
+    def test_main_arms_stack_dumps_after_taking_the_lock(self) -> None:
+        self.assertEqual(
+            self._run_main(Mock(name="lock_handle")),
+            ["acquire", f"arm:{app.paths.DISPLAY_ROLE}"],
+        )
+
+    def test_a_losing_instance_never_arms_and_so_never_rotates(self) -> None:
+        """The loser must not touch the winner's dump file at all."""
+        self.assertEqual(self._run_main(None), ["acquire"])
+
+
 class SignalHeartbeatTests(unittest.TestCase):
     """The heartbeat must stay trivial. Its body has no exception
     wrapper, and the failure mode of a raising heartbeat is specifically
@@ -798,6 +886,13 @@ class SignalHeartbeatTests(unittest.TestCase):
             app, "install_signal_handlers"
         ), patch.object(
             app, "Bootstrapper"
+        # This test does NOT patch Path.home(), so an unpatched
+        # arm_stack_dumps opens and rotates the real
+        # ~/Library/Logs/ImageView/display.stacks.log and leaves a live
+        # SIGUSR1 handler in the test process. A unit test must not touch
+        # the machine's own log directory.
+        ), patch.object(
+            app.diagnostics, "arm_stack_dumps", return_value=None
         ), patch.object(
             app.AppKit, "NSApplication"
         ), patch.object(

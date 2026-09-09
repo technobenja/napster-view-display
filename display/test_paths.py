@@ -68,6 +68,23 @@ class RootLocationTests(unittest.TestCase):
         self.assertEqual(paths.stdout_log_path(), log_dir / "display.stdout.log")
         self.assertEqual(paths.stderr_log_path(), log_dir / "display.stderr.log")
 
+    def test_the_role_names_the_log_files(self) -> None:
+        """The menu bar opens `ui.stderr.log` for itself when launchd did
+        not, and `ui_agent.build_plist()` names the same file in
+        `StandardErrorPath`. Both go through here so they cannot drift."""
+        log_dir = self.home / "Library" / "Logs" / "ImageView"
+        self.assertEqual(paths.stdout_log_path(paths.UI_ROLE), log_dir / "ui.stdout.log")
+        self.assertEqual(paths.stderr_log_path(paths.UI_ROLE), log_dir / "ui.stderr.log")
+
+    def test_stack_dumps_get_a_file_of_their_own_per_role(self) -> None:
+        """Not the stderr log: in the LaunchAgent case launchd owns that
+        file and faulthandler writes through a descriptor of its own."""
+        log_dir = self.home / "Library" / "Logs" / "ImageView"
+        self.assertEqual(paths.stacks_log_path(paths.UI_ROLE), log_dir / "ui.stacks.log")
+        self.assertEqual(
+            paths.stacks_log_path(paths.DISPLAY_ROLE), log_dir / "display.stacks.log"
+        )
+
     def test_home_is_resolved_at_call_time_not_import_time(self) -> None:
         """The whole isolation strategy — and the packaging requirement
         that nothing be computed against a home directory that may not be
@@ -96,6 +113,7 @@ class BundleSafetyTests(unittest.TestCase):
             paths.lock_path(),
             paths.stdout_log_path(),
             paths.stderr_log_path(),
+            paths.stacks_log_path(paths.UI_ROLE),
         ]
         for candidate in writable:
             with self.subTest(path=candidate):
