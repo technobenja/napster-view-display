@@ -152,8 +152,8 @@ OPTIONS = {
         # stranger's `launchctl list`. paths.BUNDLE_ID is the settled
         # value and the only place it is written down.
         "CFBundleIdentifier": paths.BUNDLE_ID,
-        "CFBundleVersion": "1.1.4",
-        "CFBundleShortVersionString": "1.1.4",
+        "CFBundleVersion": "1.1.5",
+        "CFBundleShortVersionString": "1.1.5",
         "CFBundleExecutable": "ImageView",
         # app.py sets NSApplicationActivationPolicyAccessory at runtime,
         # but the Info.plist is consulted before main() runs, so without

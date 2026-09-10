@@ -16,7 +16,8 @@ The five roots (table):
 | What                                              | Where                             |
 |---------------------------------------------------|-----------------------------------|
 | calibration.json, settings.json                   | `~/.viewlab/`                     |
-| rotation_state.json, status.json, command.json    | `~/.viewlab/state/`               |
+| rotation_state.json, status.json, command.json,   | `~/.viewlab/state/`               |
+| ui_status.json                                    |                                   |
 | image cache + manifest                            | `~/Library/Caches/<bundle-id>/`   |
 | logs                                              | `~/Library/Logs/ImageView/`       |
 | bundled seed config (READ-ONLY)                   | `display/config/` (in the bundle) |
@@ -86,6 +87,14 @@ STATUS_FILENAME = "status.json"
 # contents; the path is defined here now so that both processes agree on
 # it from day one and neither has to invent it later.
 COMMAND_FILENAME = "command.json"
+# Written by the menu bar, read by anything that wants to know whether the
+# menu bar is still *serving* rather than merely *alive*. A file of its
+# own rather than a field in status.json, for the same reason command.json
+# is separate from status.json: one writer per file. status.json is the
+# display agent's, and a second process writing into it would mean the two
+# halves of this app could no longer be reasoned about — or force-quit —
+# independently.
+UI_STATUS_FILENAME = "ui_status.json"
 LOCK_FILENAME = "display.lock"
 # The menu bar's own single-instance lock. A *separate* file from
 # LOCK_FILENAME on purpose: the two processes are independent by design
@@ -259,6 +268,19 @@ def status_path() -> Path:
 
 def command_path() -> Path:
     return state_dir() / COMMAND_FILENAME
+
+
+def ui_status_path() -> Path:
+    """`~/.viewlab/state/ui_status.json` — the menu bar's heartbeat.
+
+    In state_dir() rather than config_dir() because it is machine-written
+    and worthless to a human, unlike calibration.json. Note the contrast
+    with `ui_lock_path()`, which lives one level up precisely because the
+    lock is taken before any state has necessarily been written: the
+    heartbeat has no such requirement — it is written from a timer, long
+    after `paths.ensure_all()` has run.
+    """
+    return state_dir() / UI_STATUS_FILENAME
 
 
 def lock_path() -> Path:

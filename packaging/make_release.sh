@@ -155,10 +155,9 @@ echo "  $TESTCOUNT tests passed"
 #                           AND carry personal-handle labels, which §6.6
 #                           puts on the §11 HARD grep list. The README
 #                           beside them documents the old source-tree
-#                           install and points at "how Helm services on
-#                           this machine are already updated" (§7c), so
-#                           the whole directory goes, not just the two
-#                           plists.
+#                           install and refers to other services on the
+#                           author's own machine (§7c), so the whole
+#                           directory goes, not just the two plists.
 #   STEP{0,1}_INSTRUCTIONS.md — dev docs; contain owner-specific notes ("at the
 #                           physical console"), which the §11 SOFT
 #                           term list covers.
@@ -237,6 +236,25 @@ say "gate 2/7: whole-bundle binary-aware identity sweep (§11 assertion 4)"
 #     `grep -r`. `ui/README.md` rode inside that zip carrying a home
 #     directory path while the sweep reported 0.
 #   - it checks the FULL HARD term list, not just the home directory.
+# The gate is deliberately NOT published — it holds the catalogue of
+# strings that must never appear in a public build, and publishing that
+# catalogue would defeat its own purpose. README.md says so, and says
+# that a build from the public repository stops here. Make that stop
+# say so, rather than surfacing a bare "can't open file" from python.
+if [ ! -f "$REPO/release_gate.py" ]; then
+  fail "release_gate.py is not present.
+
+This is expected when building from the public repository: the identity
+sweeps need maintainer-only tooling that is deliberately not published,
+because it holds the list of strings that must never ship. See the
+'Building from source' section of README.md.
+
+Everything up to this point — the clean checkout, py2app, the bundle —
+has already run, and dist/ImageView.app exists. What cannot run is the
+verification that it carries nothing it should not, so this script
+refuses to produce a .dmg."
+fi
+
 "$VENV/bin/python" "$REPO/release_gate.py" --sweep-bundle "$APP" \
   || fail "first-party identity leak in the bundle"
 

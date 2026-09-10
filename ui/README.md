@@ -73,6 +73,66 @@ healthy, and "the app will not launch" is the only symptom you get.
 The display agent has its own separate lock (`~/.viewlab/display.lock`).
 The two never contend.
 
+## Telling a wedged menu bar from a healthy one
+
+A lock proves the holder **exists**. It cannot prove the holder is
+**serving** — `flock` is released only when the process dies, so a menu
+bar that has stopped responding keeps the lock indefinitely, every
+subsequent launch finds it held and exits cleanly, and the symptom is an
+app that simply will not start.
+
+So the menu bar stamps the time into `~/.viewlab/state/ui_status.json`
+every couple of seconds, from the same timer that redraws the menu. If
+that file is more than a few seconds old while the process is still
+running, its run loop has stopped servicing timers — which is what a
+wedge is, and what a lock file cannot tell you:
+
+From a source checkout, ask the app's own reader rather than
+reimplementing it — this is the same `read_ui_heartbeat` and the same
+`is_stale` the app uses, so the answer here cannot drift from the answer
+the app would give:
+
+```sh
+display/.venv/bin/python3 -c '
+import time
+from display import paths
+from ui.menubar_state import is_stale, read_ui_heartbeat
+beat = read_ui_heartbeat(paths.ui_status_path())
+now = time.time()
+print("no readable heartbeat on file" if beat == 0.0 else
+      f"last beat {now - beat:.1f}s ago, stale={is_stale(beat, now)}")'
+```
+
+With only the installed app, `ls -l ~/.viewlab/state/ui_status.json` is
+enough: the write is a rename, so the file's modification time *is* the
+last beat. Neither form can raise on a machine that has no such file.
+
+The display agent has carried the same stamp, as `heartbeat_at` in
+`status.json`, since it was first written — this is the other half of it.
+
+Three things this does **not** mean:
+
+- **A missing file is not by itself a wedge.** Older builds never wrote
+  one, and a menu bar that has not yet reached its run loop has not
+  written one yet either. Check that the process exists at all first
+  (`pgrep -fl ImageView`).
+- **A stale stamp while a menu, the About box, a settings window or a
+  file picker is on screen is EXPECTED — not a fault.** The stamp is
+  written from a timer registered in the default run-loop mode, and
+  measurement says such a timer fires **zero** times while the run loop
+  is tracking a menu or running a modal panel. That is deliberate: it is
+  exactly what lets a stale stamp catch a modal that has wedged. The cost
+  is that it cannot distinguish that from a modal a user opened on
+  purpose. **Look at the screen before concluding anything**, and never
+  kill the process on this signal alone — browsing for a picture folder
+  for thirty seconds looks identical to a thirty-second hang.
+- **A stale stamp is not proof of a hang** for a second reason: if
+  `~/.viewlab/state/` has become unwritable, a perfectly healthy menu bar
+  goes stale. It says so in `ui.stderr.log` when that happens.
+
+Nothing in the app acts on this file; it is there to be read by a person,
+and by whatever gets built on top of it.
+
 ## Rebuild after a code change
 
 Changing anything under `ui/`, `display/`, or `packaging/` requires a

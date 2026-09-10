@@ -56,6 +56,17 @@ class RootLocationTests(unittest.TestCase):
         self.assertEqual(paths.rotation_state_path(), state / "rotation_state.json")
         self.assertEqual(paths.status_path(), state / "status.json")
         self.assertEqual(paths.command_path(), state / "command.json")
+        self.assertEqual(paths.ui_status_path(), state / "ui_status.json")
+
+    def test_the_ui_heartbeat_is_not_the_display_status_file(self) -> None:
+        """One writer per file is the load-bearing rule of this app's
+        two-process design. The menu bar's heartbeat therefore gets a file
+        of its own rather than a field in the display agent's
+        `status.json` — stated as a test because "they are different
+        paths" is exactly the kind of thing a later refactor collapses to
+        save a file."""
+        self.assertNotEqual(paths.ui_status_path(), paths.status_path())
+        self.assertNotEqual(paths.ui_status_path(), paths.command_path())
 
     def test_lock_file_is_in_config_dir_not_state_dir(self) -> None:
         """Flock is taken at startup, before any state has

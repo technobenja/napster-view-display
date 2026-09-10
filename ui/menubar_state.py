@@ -24,6 +24,19 @@ is stale too — "I cannot tell" and "it is dead" get the same answer,
 because the menu that results is the useful one either way (it offers
 `Start showing pictures`, which is idempotent).
 
+**The menu bar's own heartbeat**, `write_ui_heartbeat` /
+`read_ui_heartbeat`, judged by the *same* `is_stale()`. Until this
+existed the liveness primitive pointed one way only: `display/app.py`
+writes `heartbeat_at` and this module reads it, so a wedged display agent
+was detectable — but a wedged menu bar, which is what actually happened
+on 2026-09-08, was indistinguishable from a healthy one. `ui.lock` proves
+the holder *exists*; `flock` cannot say more than that, because the
+kernel releases it only on process death. The heartbeat is what says the
+holder is *serving*.
+
+Deliberately no second staleness predicate: `is_stale()` is already
+NaN-safe and backwards-clock-safe, and two of them would drift.
+
 **Command construction.** The UI's writes are desired *state*
 plus a monotonic `advance` counter, never a queue. Building the next
 `ControlState` from the current one is arithmetic, so it is here and not
@@ -47,12 +60,29 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+from display.atomic_io import atomic_write_json
+
 # "Heartbeat stale >5s -> title reads `Not showing pictures`".
 # app.py writes the heartbeat every 2s, so this is 2.5x margin: two
 # consecutive heartbeats must be missed before the UI calls the display
 # dead. That margin is what keeps a busy machine from flickering the
 # title during a slow poll.
 STALE_AFTER_S = 5.0
+
+# How often the menu bar writes its own heartbeat, mirroring
+# `app.py`'s HEARTBEAT_INTERVAL_S and for the same arithmetic: 2.0s
+# against STALE_AFTER_S = 5.0 is 2.5x margin, so two consecutive
+# heartbeats must be missed before anything calls this process dead.
+#
+# Kept here, next to the threshold that judges it, rather than in
+# menubar.py — the display's pair is split across two processes and has
+# to be, but both halves of this one live in `ui/`, so the 2.5x margin
+# can be (and is) asserted by a test that imports no AppKit. The poll
+# timer that carries it runs at 0.4s, so this is written on every fifth
+# tick, not on every tick: at 4 writes a second, status.json's own
+# comment counts ~345,000 write-and-rename pairs a day on a machine meant
+# to sit quietly in someone's home for years.
+UI_HEARTBEAT_INTERVAL_S = 2.0
 
 # The transient label sits in the menu bar for about three seconds
 # after the picture actually changes.
@@ -225,6 +255,77 @@ def is_stale(heartbeat_at: float, now: float, threshold: float = STALE_AFTER_S) 
     if heartbeat_at <= 0.0:
         return True
     return (now - heartbeat_at) > threshold
+
+
+def read_ui_heartbeat(path: Path | str) -> float:
+    """The menu bar's own `ui_heartbeat_at`, or `0.0`. Never raises.
+
+    `0.0` covers every "I cannot tell" — the file is absent, unreadable,
+    truncated mid-write, not JSON, not an object, or carries a hostile
+    type — and `is_stale(0.0, now)` is `True`, which is the answer that
+    matters: a process whose heartbeat cannot be read is not one anything
+    should treat as serving. Same degradation rule as `read_status`, and
+    `_as_float` is shared with it so a NaN or a `true` cannot read as a
+    timestamp here either.
+
+    Deliberately a bare float rather than a `Status`-style record. There
+    is exactly one field, and the only question anyone asks of it is the
+    one `is_stale()` answers.
+    """
+    try:
+        raw = Path(path).read_text()
+    except OSError:
+        return 0.0
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return 0.0
+    if not isinstance(data, Mapping):
+        return 0.0
+    return _as_float(data.get("ui_heartbeat_at"))
+
+
+def write_ui_heartbeat(path: Path | str, now: float | None = None) -> bool:
+    """Stamp `ui_heartbeat_at` into `ui_status.json`. **Never raises.**
+
+    That is not a nicety, it is the whole safety argument for putting
+    this on a live timer. `display/app.py` considered and explicitly
+    REVERTED reusing its signal-responsiveness timer for the display's
+    heartbeat, because an exception off an NSTimer selector kills the run
+    loop — and the failure mode of a *raising heartbeat* is specifically
+    losing the ability to stop the service (`launchctl kickstart` then
+    hangs indefinitely, confirmed the hard way). A heartbeat that can
+    wedge the process it is meant to prove healthy is worse than no
+    heartbeat at all.
+
+    So this function swallows everything an `atomic_write_json` can
+    produce and reports by return value, the same contract
+    `control.write_control` and `app.merge_status` already follow.
+    `OSError` is the live one — a full or read-only disk, a directory
+    where the file should be. `TypeError` / `ValueError` **cannot arise
+    from this caller today**: `menubar._write_ui_heartbeat` passes
+    `time.time()`, which json can always encode. They are caught anyway
+    so that a future field added to this document cannot turn a heartbeat
+    into a crash; `merge_status` has the same pair for the same reason,
+    and got them after an unserializable status value escaped into a
+    caller's broad except and discarded an entirely successful poll.
+
+    Written whole, not merged into whatever is already on disk the way
+    `merge_status` does. There is one field and one writer, so a
+    read-modify-write would buy nothing and cost a read every 2 seconds
+    — and a merge would faithfully preserve a stale key written by some
+    future version, which is the opposite of what a heartbeat wants.
+
+    The write is atomic (temp file + `os.replace`) for the same reason
+    `status.json`'s is: a reader that catches a half-written file would
+    read `0.0` and report a healthy process as dead.
+    """
+    moment = time.time() if now is None else now
+    try:
+        atomic_write_json(Path(path), {"ui_heartbeat_at": moment})
+    except (OSError, TypeError, ValueError):
+        return False
+    return True
 
 
 def setup_needed(settings_data: object) -> bool:
@@ -564,6 +665,7 @@ __all__ = [
     "LABEL_MAX_CHARS",
     "STALE_AFTER_S",
     "TITLE_HOLD_S",
+    "UI_HEARTBEAT_INTERVAL_S",
     "State",
     "Status",
     "TitleTracker",
@@ -575,7 +677,9 @@ __all__ = [
     "is_stale",
     "parse_status",
     "read_status",
+    "read_ui_heartbeat",
     "setup_needed",
     "title_for",
     "truncate_label",
+    "write_ui_heartbeat",
 ]

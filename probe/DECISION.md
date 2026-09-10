@@ -141,9 +141,9 @@ erroring, which is what produced the "stale," then "still-wallpaper" results acr
 both sessions.
 
 **Corrected next step:** the probe's framebuffer capture step needs to run from a
-Terminal window opened **locally at the mini's own console/GUI login**, not through
+Terminal window opened **locally at the machine's own console/GUI login**, not through
 a remote Claude Code / SSH session. Options, cheapest first:
-1. Owner opens Terminal.app directly on the mini (physically or via Screen Sharing
+1. Owner opens Terminal.app directly on the machine (physically or via Screen Sharing
    with "control", not just view), grants **that specific Terminal.app** Screen
    Recording, restarts it, and runs `./probe/run-probe.sh` by hand there.
 2. Owner pastes the resulting `screen-2.png` (or just describes/photographs what it
@@ -169,7 +169,7 @@ redistributed in this repository.)
 
 ## 9. Session 3 (2026-07-16, ~15:09) — real local capture, Q1 resolved
 
-Owner opened a genuine local Terminal at the mini's own console (confirmed via
+Owner opened a genuine local Terminal at the machine's own console (confirmed via
 `who`: an active `console` session, distinct from the `ttys000`/SSH session this
 Claude Code instance runs in) and ran `./probe/run-probe.sh` from there with
 Napster confirmed running. Result: **a real, live local framebuffer capture** —

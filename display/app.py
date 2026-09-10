@@ -10,7 +10,7 @@ Run interactively for Step 6's soak test:
 
     ./.venv/bin/python3 app.py
 
-Not yet a LaunchAgent — that's Step 7's separate approval gate. Run only from a Terminal at the mini's own physical console, or
+Not yet a LaunchAgent — that's Step 7's separate approval gate. Run only from a Terminal at the machine's own physical console, or
 Screen Sharing with control.
 """
 

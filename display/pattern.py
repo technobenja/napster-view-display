@@ -18,7 +18,7 @@ rather than reimplementing them — this script is still narrowly-scoped
 Step 1 work and does not yet have the shared `display_target.py`
 module the plan reserves for Step 2.
 
-Run this ONLY from a Terminal at the mini's own physical console, or a
+Run this ONLY from a Terminal at the machine's own physical console, or a
 Screen Sharing session with control — never over SSH. Per
 probe/DECISION.md §8, an SSH-attached process has no window-server
 identity; it will not error, it will just silently fail to draw anything

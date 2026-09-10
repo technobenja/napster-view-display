@@ -17,7 +17,7 @@ What it does:
      magenta fill covering that screen's full frame, and keeps an
      NSApplication run loop alive until the process is killed.
 
-Run this ONLY from a Terminal at the mini's own physical console, or a
+Run this ONLY from a Terminal at the machine's own physical console, or a
 Screen Sharing session with control — never over SSH. Per
 probe/DECISION.md §8, an SSH-attached process has no window-server
 identity; it will not error, it will just silently fail to draw anything

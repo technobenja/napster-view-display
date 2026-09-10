@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -147,6 +148,174 @@ class TestReadStatus(unittest.TestCase):
         parsed = ms.read_status(path)
         self.assertTrue(parsed.present)
         self.assertEqual(parsed.heartbeat_at, 12.0)
+
+
+class TestUiHeartbeat(unittest.TestCase):
+    """The menu bar's own heartbeat — the mirror of the display's.
+
+    Its whole purpose is to distinguish a menu bar that is *serving* from
+    one that is merely alive and holding `ui.lock`, so the tests that
+    matter are the ones about what happens when it cannot be read or
+    written.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self._tmp.name)
+        self.addCleanup(self._tmp.cleanup)
+
+    # -- cadence ------------------------------------------------------
+    #
+    # Deliberately NOT here. The margin that matters is between
+    # STALE_AFTER_S and the gap that actually reaches the disk, and that
+    # gap depends on `menubar.POLL_INTERVAL_S` — importing which would put
+    # AppKit into this file, which is the one thing it does not do. The
+    # cadence assertions live in `ui/test_menubar.py` alongside the poll
+    # interval they depend on. Stating it as
+    # `STALE_AFTER_S >= 2 * UI_HEARTBEAT_INTERVAL_S`, as this file first
+    # did, ignores poll granularity and is satisfied by an interval that
+    # goes stale after ONE missed beat.
+
+    # -- writing ------------------------------------------------------
+
+    def test_a_written_heartbeat_reads_back(self):
+        path = self.dir / "ui_status.json"
+        self.assertTrue(ms.write_ui_heartbeat(path, 1234.5))
+        self.assertEqual(ms.read_ui_heartbeat(path), 1234.5)
+
+    def test_the_write_creates_the_state_directory(self):
+        """`state_dir()` may not exist on a first run, and a heartbeat
+        that cannot be written until something else has run first is a
+        heartbeat with a startup blind spot."""
+        path = self.dir / "state" / "ui_status.json"
+        self.assertTrue(ms.write_ui_heartbeat(path, 7.0))
+        self.assertEqual(ms.read_ui_heartbeat(path), 7.0)
+
+    def test_the_write_carries_only_the_heartbeat(self):
+        """One field, one writer. A merge would preserve keys this
+        process did not write, which for a liveness file is the opposite
+        of what is wanted."""
+        path = self.dir / "ui_status.json"
+        ms.write_ui_heartbeat(path, 5.0)
+        self.assertEqual(json.loads(path.read_text()), {"ui_heartbeat_at": 5.0})
+
+    def test_a_later_write_replaces_the_earlier_one(self):
+        path = self.dir / "ui_status.json"
+        ms.write_ui_heartbeat(path, 1.0)
+        ms.write_ui_heartbeat(path, 2.0)
+        self.assertEqual(ms.read_ui_heartbeat(path), 2.0)
+
+    def test_an_unwritable_path_returns_false_and_never_raises(self):
+        """The safety argument for putting this on a live timer. An
+        exception off an NSTimer selector kills the run loop, and the
+        failure mode of a raising heartbeat is losing the ability to stop
+        the process it was meant to prove healthy."""
+        path = self.dir / "ui_status.json"
+        path.mkdir()  # a directory where the file should be
+        self.assertFalse(ms.write_ui_heartbeat(path, 1.0))
+
+    def test_an_unserializable_moment_returns_false_and_never_raises(self):
+        """`OSError` is not the only way `atomic_write_json` can fail —
+        `json.dumps` raises `TypeError` on a value it cannot encode.
+        `merge_status` learned this the same way."""
+        path = self.dir / "ui_status.json"
+        self.assertFalse(ms.write_ui_heartbeat(path, object()))
+        self.assertFalse(path.exists())
+
+    def test_a_failed_write_leaves_the_previous_heartbeat_intact(self):
+        """Atomic write-then-rename: a reader must never catch a
+        half-written file and conclude a healthy process is dead."""
+        path = self.dir / "ui_status.json"
+        ms.write_ui_heartbeat(path, 99.0)
+        self.assertFalse(ms.write_ui_heartbeat(path, object()))
+        self.assertEqual(ms.read_ui_heartbeat(path), 99.0)
+
+    def test_the_write_replaces_the_file_rather_than_rewriting_it(self):
+        """Behavioural proxy for "this write is atomic". A temp file plus
+        `os.replace` lands a *new* inode at the path; writing in place
+        reuses the old one, and a reader that catches an in-place write
+        half done reads 0.0 and reports a healthy process dead.
+
+        Asserting on the inode rather than on `atomic_write_json` being
+        called: pattern-presence is not behaviour, and swapping in a
+        plain `write_text` is exactly the shortcut this guards."""
+        path = self.dir / "ui_status.json"
+        ms.write_ui_heartbeat(path, 1.0)
+        first = path.stat().st_ino
+        ms.write_ui_heartbeat(path, 2.0)
+        self.assertNotEqual(path.stat().st_ino, first)
+
+    def test_no_temp_files_are_left_behind(self):
+        """Every 2 seconds, forever. A leaked temp file per beat would
+        fill `state/` at ~43,000 files a day."""
+        path = self.dir / "ui_status.json"
+        for moment in range(10):
+            ms.write_ui_heartbeat(path, float(moment))
+        self.assertEqual([p.name for p in self.dir.iterdir()], ["ui_status.json"])
+
+    def test_the_default_moment_is_now(self):
+        before = time.time()
+        path = self.dir / "ui_status.json"
+        ms.write_ui_heartbeat(path)
+        self.assertGreaterEqual(ms.read_ui_heartbeat(path), before)
+
+    # -- reading ------------------------------------------------------
+
+    def test_a_missing_file_is_stale(self):
+        beat = ms.read_ui_heartbeat(self.dir / "nope.json")
+        self.assertEqual(beat, 0.0)
+        self.assertTrue(ms.is_stale(beat, now=0.0))
+
+    def test_a_directory_never_raises(self):
+        self.assertEqual(ms.read_ui_heartbeat(self.dir), 0.0)
+
+    def test_a_half_written_file_is_stale_not_an_exception(self):
+        path = self.dir / "ui_status.json"
+        path.write_text('{"ui_heartbeat_at": 12')
+        self.assertEqual(ms.read_ui_heartbeat(path), 0.0)
+
+    def test_a_json_list_is_stale(self):
+        path = self.dir / "ui_status.json"
+        path.write_text("[1, 2, 3]")
+        self.assertEqual(ms.read_ui_heartbeat(path), 0.0)
+
+    def test_a_nan_heartbeat_is_rejected(self):
+        """NaN fails every comparison, so a NaN heartbeat would read as
+        `not stale` forever — the one answer that hides a wedge
+        permanently. Shared with `parse_status` via `_as_float`."""
+        path = self.dir / "ui_status.json"
+        path.write_text('{"ui_heartbeat_at": NaN}')
+        beat = ms.read_ui_heartbeat(path)
+        self.assertEqual(beat, 0.0)
+        self.assertTrue(ms.is_stale(beat, now=1e9))
+
+    def test_a_boolean_is_not_a_timestamp(self):
+        path = self.dir / "ui_status.json"
+        path.write_text('{"ui_heartbeat_at": true}')
+        self.assertEqual(ms.read_ui_heartbeat(path), 0.0)
+
+    def test_the_display_field_name_is_not_accepted_here(self):
+        """`ui_status.json` and `status.json` are different files with
+        different owners. Reading the display's field name out of the
+        UI's file would make a running display look like a running menu
+        bar — exactly the confusion this whole mechanism exists to
+        prevent."""
+        path = self.dir / "ui_status.json"
+        path.write_text(json.dumps({"heartbeat_at": 500.0}))
+        self.assertEqual(ms.read_ui_heartbeat(path), 0.0)
+
+    # -- the incident -------------------------------------------------
+
+    def test_a_stopped_process_goes_stale_while_its_last_beat_persists(self):
+        """The shape of 2026-09-08: the process is still alive, the file
+        it wrote is still on disk and still readable, and the lock is
+        still held. Only the *age* of the heartbeat can say that nothing
+        is being served."""
+        path = self.dir / "ui_status.json"
+        ms.write_ui_heartbeat(path, 1000.0)
+        beat = ms.read_ui_heartbeat(path)
+        self.assertFalse(ms.is_stale(beat, now=1000.0 + ms.STALE_AFTER_S))
+        self.assertTrue(ms.is_stale(beat, now=1000.0 + ms.STALE_AFTER_S + 0.01))
 
 
 class TestStatePrecedence(unittest.TestCase):

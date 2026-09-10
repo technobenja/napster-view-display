@@ -13,7 +13,7 @@ Standalone verification (Step 5):
     ./.venv/bin/python3 window.py path/to/image.png
     ./.venv/bin/python3 window.py            # draws the empty-pool fallback
 
-Run only from a Terminal at the mini's own physical console, or Screen
+Run only from a Terminal at the machine's own physical console, or Screen
 Sharing with control — same rule as smoke_test.py and pattern.py.
 """
 

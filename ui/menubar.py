@@ -18,6 +18,18 @@ There is no other channel between them — no sockets, no notifications,
 no shared memory — which is what makes "force-quit the UI and the
 pictures keep rotating" true by construction rather than by care.
 
+It also writes a third file, `~/.viewlab/state/ui_status.json`, carrying
+one field: `ui_heartbeat_at`, stamped from `pollTick_`. That is **not** a
+channel to the display, which never reads it — it is the mirror image of
+the display's own `heartbeat_at`, and it exists because `ui.lock` proves
+only that this process is *alive*. On 2026-09-08 a wedged menu bar held
+that lock while serving nobody, every relaunch found the lock held and
+exited 0 exactly as designed, and nothing on the machine could tell that
+state from a healthy one. A heartbeat can, because it is written from a
+timer: it stops the moment the run loop stops servicing timers, which is
+precisely what a wedge is. Nothing in the app reads it yet — acting on
+it is a separate, separately-approved change.
+
 **Conventions this file follows, each for a reason already paid for:**
 
 - `@objc.python_method` on every private helper. A plain snake_case
@@ -111,6 +123,15 @@ class MenuBarController(AppKit.NSObject):
         self._status = ms.Status()
         self._needs_setup = False
         self._text_region_width = 0.0
+        # Last `ui_heartbeat_at` this process wrote, throttling the
+        # heartbeat down from the 0.4s poll to ms.UI_HEARTBEAT_INTERVAL_S.
+        # Same shape as `app.py`'s `_last_heartbeat_at`, including the
+        # 0.0 seed: it makes the first tick after startup write
+        # unconditionally.
+        self._last_ui_heartbeat_at = 0.0
+        # Whether the last heartbeat write failed, so that only the
+        # transitions are logged. See `_write_ui_heartbeat`.
+        self._ui_heartbeat_failing = False
         # The open calibration window, or None. Held here rather
         # than on the app object because the menu's enabled-state depends
         # on it, and because nothing else retains it — a
@@ -143,6 +164,28 @@ class MenuBarController(AppKit.NSObject):
         # display is running fine, which is exactly the misleading state
         # the precedence list is ordered to avoid.
         self._refresh()
+        # ** DO NOT MOVE THIS TIMER TO NSRunLoopCommonModes. **
+        # `scheduledTimerWithTimeInterval_...` adds it to
+        # NSDefaultRunLoopMode only, and that is load-bearing now that the
+        # tick carries `ui_heartbeat_at`. `runModal()` spins the run loop
+        # in NSModalPanelRunLoopMode, where default-mode timers stop
+        # firing — which is precisely why a heartbeat on this timer can
+        # detect a modal wedge, the leading suspect for 2026-09-08. Common
+        # modes would keep it ticking straight through one and report a
+        # process that cannot answer anything as healthy: worse than no
+        # heartbeat, because it would be believed.
+        #
+        # What is measured and what is not: the mode contract itself is
+        # measured, here, by `RunLoopModeContractTests` in
+        # `ui/test_menubar.py`, with a live positive control. The
+        # end-to-end path is NOT — no session has watched a real
+        # `NSAlert.runModal()` in this process and observed the heartbeat
+        # go stale, because staging one puts a modal panel on the owner's
+        # live screen. The wedge that has actually been reproduced is a
+        # `kill -STOP`, which stops the whole process and is a strictly
+        # stronger stop than a modal run loop. So: *a* wedge is detected,
+        # measured; *the* suspected wedge is derived from the mode
+        # contract plus Apple's documentation, not observed.
         self._timer = AppKit.NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
             POLL_INTERVAL_S, self, "pollTick:", None, True
         )
@@ -250,9 +293,18 @@ class MenuBarController(AppKit.NSObject):
 
         Rebuilding the whole menu every tick would be simpler to write
         and worse to use: an `NSMenu` that is already open when its items
-        are replaced can drop the highlight or close outright, and this
-        menu is re-evaluated four times while a user is reading it.
-        Titles and enabled-state are mutated in place instead.
+        are replaced can drop the highlight or close outright. Titles and
+        enabled-state are mutated in place instead.
+
+        This docstring used to add "and this menu is re-evaluated four
+        times while a user is reading it". **Measured: zero.** An open
+        menu tracks in `NSEventTrackingRunLoopMode`, where a
+        default-mode timer does not fire at all, so `pollTick_` stops for
+        as long as the menu is on screen and the menu a user is reading
+        is frozen at whatever it said when it opened. That was a harmless
+        inaccuracy until this tick started carrying `ui_heartbeat_at`;
+        now the same pause reads as staleness, so it is written down
+        rather than repeated. See `_write_ui_heartbeat`.
         """
         menu = AppKit.NSMenu.alloc().init()
         # Our own setEnabled_ calls are the authority. With
@@ -329,7 +381,44 @@ class MenuBarController(AppKit.NSObject):
         """The one timer. Broad except for the documented reason: an
         exception off an NSTimer selector kills the run loop, and a menu
         bar that stops updating while still accepting clicks is worse
-        than one that is visibly gone."""
+        than one that is visibly gone.
+
+        The heartbeat goes **first**, and this is a deliberate divergence
+        from `app.py`, which writes its heartbeat last inside the same
+        shared `try`. The two have different stakes. A display heartbeat
+        suppressed by an unrelated exception costs a menu title that
+        reads `Not showing pictures` and offers an idempotent
+        `Start showing pictures`. A *UI* heartbeat suppressed the same way
+        would eventually be read as "this process is wedged, kill it" —
+        so a bug in `_refresh` would present as a wedge, and the remedy
+        for a wedge is a SIGKILL of a process whose run loop was fine.
+
+        Ordering it first makes the heartbeat mean exactly one thing:
+        **an NSTimer fired**, i.e. this run loop is still servicing
+        timers. That is the property that the incident destroyed and the
+        only property `ui.lock` cannot express.
+
+        **Two `try` blocks, not one**, and that is the other half of the
+        same argument. Ordering alone would leave the mirror-image
+        coupling: anything escaping `_write_ui_heartbeat` would suppress
+        `_refresh` on every tick, permanently, while printing a traceback
+        at 0.4s — 216,000 a day through a rotated 10 MB log, which is the
+        anti-diagnostic `_write_ui_heartbeat` takes care to avoid one
+        level down. Independent blocks buy both properties at once, and
+        they stop "this method cannot raise" from being a safety-critical
+        claim a future editor has to keep true. (It is *nearly* true and
+        not quite: `paths.ui_status_path()` goes through `Path.home()`,
+        which raises `RuntimeError` when a home directory cannot be
+        resolved — not in the tuple `write_ui_heartbeat` catches.)
+        """
+        try:
+            self._write_ui_heartbeat()
+        except Exception:
+            print(
+                f"pollTick_: the heartbeat raised, ignoring it this tick "
+                f"— the menu below is unaffected:\n{traceback.format_exc()}",
+                file=sys.stderr,
+            )
         try:
             self._refresh()
         except Exception:
@@ -337,6 +426,87 @@ class MenuBarController(AppKit.NSObject):
                 f"pollTick_: unexpected exception, ignoring this tick:\n"
                 f"{traceback.format_exc()}",
                 file=sys.stderr,
+            )
+
+    @objc.python_method
+    def _write_ui_heartbeat(self) -> None:
+        """`ui_heartbeat_at` — how anything tells a *serving* menu bar
+        from one that is merely alive and holding `ui.lock`.
+
+        Throttled to `ms.UI_HEARTBEAT_INTERVAL_S` rather than written on
+        every 0.4s tick; see that constant for the arithmetic.
+
+        Only the timer ever calls this. Not `start()`, not `main()`,
+        deliberately: a heartbeat written from anywhere but a timer
+        callback would assert liveness this process has not yet
+        demonstrated. A UI that has built its status item but never
+        reached `app.run()` — one of the two mechanisms that fit the
+        2026-09-08 incident — correctly has no heartbeat at all, and
+        `is_stale()` already answers `True` for an absent one.
+
+        Nothing removes the file on quit. A stale heartbeat left behind by
+        a process that exited is a true statement: that process is not
+        serving. Deleting it would be a second writer's worth of race for
+        no gain.
+        """
+        now = time.time()
+        elapsed = now - self._last_ui_heartbeat_at
+        # `0 <= elapsed` is not redundant. Without it, an NTP step
+        # backwards by T makes `elapsed` negative, the throttle
+        # short-circuits, and nothing is written for T + 2s — while
+        # `is_stale()` deliberately treats a future timestamp as fresh, so
+        # a reader sees a healthy process for that entire window and a
+        # wedge inside it is invisible. `app.py:_write_heartbeat` has the
+        # same shape without this guard; there it costs a wrong menu
+        # title, here it costs the only signal this file exists to carry.
+        # Fixing it there is owed and is not this change's to make.
+        if 0 <= elapsed < ms.UI_HEARTBEAT_INTERVAL_S:
+            return
+        # Advanced whether or not the write succeeded. A disk that cannot
+        # take this write will not take the next one either, and retrying
+        # at 4Hz against a full disk would turn a reporting failure into
+        # a performance one. `write_ui_heartbeat` never raises; it returns
+        # False, and the resulting staleness is itself the report.
+        self._last_ui_heartbeat_at = now
+        failing = not ms.write_ui_heartbeat(paths.ui_status_path(), now)
+        if failing != self._ui_heartbeat_failing:
+            # Log the *transitions* only, never the state. A menu bar that
+            # cannot write this file goes stale and therefore reads as
+            # wedged while its run loop is perfectly healthy, and the only
+            # thing that distinguishes the two is a line saying so. At one
+            # line every 2s it would instead be 43,000 lines a day pushing
+            # everything else out of a rotated 10 MB log, which is how a
+            # diagnostic becomes an anti-diagnostic.
+            #
+            # ** THIS IS NOT THE ONLY FALSE POSITIVE, AND AN EARLIER
+            # VERSION OF THIS COMMENT CLAIMED IT WAS. ** Measured, 0.1s
+            # timer, 1.0s per mode: NSDefaultRunLoopMode 11 fires,
+            # NSModalPanelRunLoopMode 0, NSEventTrackingRunLoopMode 0. The
+            # very property that lets this detect a modal wedge — a
+            # default-mode timer stops in every other mode — also freezes
+            # the heartbeat during three ordinary, intentional
+            # interactions:
+            #
+            #   * an open menu (event tracking), for as long as it is read;
+            #   * the About box and `_alert()`, which are `runModal()`;
+            #   * Settings / First Run / Adjust the circle, which carry
+            #     `NSOpenPanel.runModal()` — the file picker in the app's
+            #     primary setup flow, held open far longer than 5s.
+            #
+            # So a stale `ui_heartbeat_at` means "not servicing default-
+            # mode timers", which is a superset of "wedged". Nothing may
+            # act destructively on staleness alone: a Phase 4 that offered
+            # to SIGKILL on this signal would kill a user's open file
+            # picker mid-browse. A default-mode timer cannot tell modally
+            # wedged from modally busy on purpose; the corroborating
+            # common-modes signal that can is recorded against Phase 3/4
+            # in docs/plans/ui-wedge-remediation.md.
+            self._ui_heartbeat_failing = failing
+            diagnostics.note(
+                f"menubar: could not write {paths.ui_status_path()}; this "
+                f"process is healthy but will read as wedged until it can."
+                if failing
+                else f"menubar: {paths.ui_status_path()} is writable again."
             )
 
     @objc.python_method

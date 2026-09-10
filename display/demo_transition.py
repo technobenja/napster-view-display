@@ -8,7 +8,7 @@ real ~15-minute production interval.
 
     ./.venv/bin/python3 demo_transition.py [--interval 8] [--fade 2]
 
-Run only from a Terminal at the mini's own physical console, or Screen
+Run only from a Terminal at the machine's own physical console, or Screen
 Sharing with control — same rule as every other display/*.py script.
 """
 

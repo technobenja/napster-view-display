@@ -31,7 +31,7 @@ captured nothing real (Phase 1 lost a day to `screencapture` silently
 returning a placeholder wallpaper image under SSH). This applies to
 `app.py`, `pattern.py`, `smoke_test.py`, `window.py`, `demo_transition.py`
 — anything that opens a window or calls `screencapture`. Run these only
-from a Terminal at the mini's own physical console, or a Screen Sharing
+from a Terminal at the machine's own physical console, or a Screen Sharing
 session with control (not just observe). This is also why this project's
 own Claude Code sessions can't verify optics or window-server behavior
 themselves — see `GUARDRAILS.md`.

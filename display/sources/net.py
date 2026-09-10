@@ -6,11 +6,13 @@ sharper than "the user chose the URL":
 
 **The list URL is chosen by the user. The image URLs inside its response
 are not.** A trusted-looking `example.com/pictures.json` can answer with
-`["http://localhost:11434/api/tags", "http://192.0.2.10:8883/..."]`. On the
-machine this was written for that is pointed rather than theoretical:
-Ollama listens on 11434, OB2 on 7423, seven dashboards on 5050-5057. That
-distinction — user-chosen outer URL, attacker-chosen inner URLs — is the
-entire reason this module exists.
+`["http://localhost:11434/api/tags", "http://192.0.2.10:8883/..."]`. That is
+pointed rather than theoretical on any machine that runs anything locally —
+a model server, a database, a router's admin page, a metadata endpoint — and
+a display app is an unusually good place to aim it, because it will fetch
+whatever it is handed and never show you the reply. That distinction —
+user-chosen outer URL, attacker-chosen inner URLs — is the entire reason
+this module exists.
 
 What is enforced here:
 
