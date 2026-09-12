@@ -342,10 +342,26 @@ class NoteTests(_IsolatedHome):
 class MenubarContentionTests(unittest.TestCase):
     """`menubar.main()` for real, in a subprocess, with the lock held.
 
-    The contention path returns before any AppKit object is built, so
-    this needs no window server. It is the only honest way to test the
-    launchd branch: "was fd 2 already a regular file" is decided by
-    whoever started the process.
+    It is the only honest way to test the launchd branch: "was fd 2
+    already a regular file" is decided by whoever started the process.
+
+    🔴 **These launch as the LaunchAgent, and that is load-bearing now.**
+    This docstring used to say "the contention path returns before any
+    AppKit object is built, so this needs no window server". **Phase 4b
+    made that false.** A losing *human* launch now builds an `NSPanel`,
+    shows it, and runs a run loop until the window is dismissed — which
+    is the whole point of the phase, and which no `subprocess.run` can
+    ever dismiss. Left as it was, each of these tests put a real panel on
+    the developer's screen and sat there until its 120s timeout.
+
+    `XPC_SERVICE_NAME` set to the UI agent's own label is the measured
+    discriminator for "started by the LaunchAgent" — see
+    `contention_state.launched_by_agent` — and an agent respawn
+    deliberately shows nothing and signals nothing. Everything these
+    tests assert (exit 0, the reason reaching the log, the stack file
+    left alone, one writer per stderr) happens before that branch and is
+    unchanged by it. The human branch's exit code is covered in
+    `ui/test_menubar.py`, where the window is not real.
     """
 
     MAIN = "from ui import menubar; raise SystemExit(menubar.main())"
@@ -369,6 +385,9 @@ class MenubarContentionTests(unittest.TestCase):
         env = dict(os.environ)
         env["HOME"] = str(self.home)
         env["PYTHONPATH"] = str(REPO)
+        # See the class docstring: without this the child shows a window
+        # and blocks until its timeout.
+        env["XPC_SERVICE_NAME"] = paths.UI_AGENT_LABEL
         return env
 
     def test_a_losing_menu_bar_records_why_and_still_exits_0(self) -> None:

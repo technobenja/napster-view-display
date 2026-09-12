@@ -87,14 +87,20 @@ wrote it.
    holds the lock", and the gap is real.** `single_instance._no_guard()`
    returns an unlocked handle when the lock file cannot be created at
    all (an unwritable home, a read-only volume), which the call sites
-   cannot distinguish from success — `is None` is the whole contract.
-   Under that sentinel two processes can both proceed to arm, so the
-   sole-writer property degrades exactly when the guard does. That is
-   accepted, not overlooked: the sentinel's behaviour is deliberate
-   (`single_instance.acquire`'s docstring gives the reasoning) and
-   telling the two states apart needs a wider return type than this
-   phase is entitled to change. The cost of hitting it is one rotated
-   log, on a machine that already cannot write its own lock file.
+   could not distinguish from success — `is None` was the whole
+   contract. Under that sentinel two processes could both proceed to
+   arm, so the sole-writer property degraded exactly when the guard
+   did.
+
+   🔵 **CLOSED.** `acquire()` now reports `UNGUARDED` as a distinct
+   outcome, so the call sites pass `sole_writer=False` and this
+   function arms without rotating. The sentinel's *behaviour* is
+   still deliberately unchanged (`single_instance.acquire`'s
+   docstring gives the reasoning); what was missing was the wider
+   return type, and that is what was added. What remains is the
+   accepted cost on the other side of the trade: under the sentinel
+   `<role>.stacks.log` is never rotated, on a machine that already
+   cannot write its own lock file.
 
 **Known gaps, recorded so they are not rediscovered as surprises:**
 
@@ -161,6 +167,13 @@ STACK_DUMP_SIGNAL = signal.SIGUSR1
 # by anything, and this must not be the sole reference to the log.
 _dump_file: IO[str] | None = None
 _stderr_file: IO[str] | None = None
+
+#: The path `arm_stack_dumps()` armed, or None. Module state rather than
+#: a caller's variable because the heartbeat writer needs it and is three
+#: objects away from `main()`, where arming happens — and threading it
+#: through a controller constructor would make a diagnostic detail part
+#: of that class's contract. `armed_stacks_path()` is the read side.
+_stacks_path: Path | None = None
 
 
 #: `O_NOFOLLOW` refuses to open through a symlink; `0o600` keeps the mode
@@ -321,7 +334,21 @@ def release_stderr() -> None:
     _stderr_file = None
 
 
-def arm_stack_dumps(role: str) -> Path | None:
+def armed_stacks_path() -> Path | None:
+    """Where `kill -USR1` on **this** process writes, or None if stack
+    dumps were never armed.
+
+    Exists so that the heartbeat can publish `stacks_armed` /
+    `stacks_path` into `ui_status.json` without `main()` having to hand
+    them down through the controller. The arriving instance reads those
+    fields to decide whether signalling the holder is a diagnostic or a
+    kill — `SIGUSR1`'s default disposition is terminate, and the handler
+    exists only from v1.1.3.
+    """
+    return _stacks_path
+
+
+def arm_stack_dumps(role: str, *, sole_writer: bool = True) -> Path | None:
     """Make `kill -USR1 <pid>` dump every thread's Python stack to
     `~/Library/Logs/ImageView/<role>.stacks.log`.
 
@@ -337,8 +364,18 @@ def arm_stack_dumps(role: str) -> Path | None:
     **Call this only after the single-instance lock is won.** It rotates
     the file, and rotation from a losing instance would zero a running
     instance's accumulated dumps in place — see this module's docstring.
+
+    `sole_writer=False` arms the handler but **skips the rotation**, and
+    it is the answer to the gap this module's docstring used to record
+    and could not close: `single_instance.acquire()` now reports
+    `UNGUARDED` distinctly, so a process that is running *without* a lock
+    can say so, and a second unguarded instance no longer zeroes a
+    running instance's accumulated dumps. Arming still happens — a
+    process with no guard is exactly the one whose stacks someone will
+    want — so the only cost is an unrotated file on a machine that
+    already cannot write its own lock file.
     """
-    global _dump_file
+    global _dump_file, _stacks_path
 
     # Documented as unavailable on Windows. This app is macOS-only, but a
     # missing attribute here must degrade to "no stack dumps", never to
@@ -350,7 +387,8 @@ def arm_stack_dumps(role: str) -> Path | None:
     if not paths.ensure_dir(path.parent):
         return None
 
-    rotate_if_oversized(path)
+    if sole_writer:
+        rotate_if_oversized(path)
 
     handle = _open_log(path)
     if handle is None:
@@ -367,6 +405,7 @@ def arm_stack_dumps(role: str) -> Path | None:
         return None
 
     _dump_file = handle
+    _stacks_path = path
     return path
 
 
@@ -377,7 +416,8 @@ def disarm_stack_dumps() -> None:
     without it a test leaves a live handler pointed at a temporary
     directory the next test has already deleted.
     """
-    global _dump_file
+    global _dump_file, _stacks_path
+    _stacks_path = None
     try:
         faulthandler.unregister(STACK_DUMP_SIGNAL)
     except (OSError, ValueError, RuntimeError):

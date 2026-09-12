@@ -93,11 +93,15 @@ UI_MODULES = [
     "ui",
     "ui.calibrate_state",
     "ui.calibrate_window",
+    "ui.contention",
+    "ui.contention_state",
     "ui.first_run_state",
     "ui.first_run_window",
     "ui.identify",
     "ui.menubar",
     "ui.menubar_state",
+    "ui.notice_state",
+    "ui.notice_window",
     "ui.settings_state",
     "ui.settings_window",
     "ui.ui_agent",
@@ -114,7 +118,15 @@ UI_MODULES = [
 
 # PyObjC's lazy framework loading defeats modulegraph's static analysis,
 # so anything unnamed can be missing at runtime.
-PYOBJC_MODULES = ["objc", "AppKit", "Foundation"]
+#
+# `Quartz` is here for `ui.contention.window_facts`, which imports it
+# *inside* the function so that a machine without it degrades to "the
+# window server could not be asked" rather than failing at process
+# entry — and an import modulegraph cannot see statically is exactly the
+# kind this list exists to name. Without it the bundle would ship with no
+# Quartz, every contended launch would silently lose the two verdicts
+# that depend on windows, and nothing would say so.
+PYOBJC_MODULES = ["objc", "AppKit", "Foundation", "Quartz"]
 
 OPTIONS = {
     # Carbon Apple Events: hangs at startup under launchd, and would
@@ -152,8 +164,8 @@ OPTIONS = {
         # stranger's `launchctl list`. paths.BUNDLE_ID is the settled
         # value and the only place it is written down.
         "CFBundleIdentifier": paths.BUNDLE_ID,
-        "CFBundleVersion": "1.1.5",
-        "CFBundleShortVersionString": "1.1.5",
+        "CFBundleVersion": "1.1.6",
+        "CFBundleShortVersionString": "1.1.6",
         "CFBundleExecutable": "ImageView",
         # app.py sets NSApplicationActivationPolicyAccessory at runtime,
         # but the Info.plist is consulted before main() runs, so without

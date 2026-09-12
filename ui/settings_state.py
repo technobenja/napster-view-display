@@ -6,7 +6,7 @@ be wrong in an interesting way, so it is the part that is separable and
 tested — the same split `menubar_state.py` and `calibrate_state.py`
 already make, for the same reason.
 
-Five things live here:
+Six things live here:
 
 **The form model.** `SourceForm` holds all three sources' fields at once,
 because layout shows all three at once. The unselected rows are
@@ -28,6 +28,12 @@ both directions lives here.
 state, not the last-written setting. The subprocess is injected so the
 decision — what a given `launchctl print` result *means* — is testable
 without a launchd domain.
+
+**The folder picker's outcome.** `sheet_folder_choice` is the one place
+that decides what a folder picker's result adopts. It lives here, and is
+shared by both windows, for the reason the `probe_image_server` split
+records: two paths answering the same question a different way is how one
+of them ends up confidently wrong.
 
 **The settings document.** Merging into whatever is already in
 `settings.json` rather than writing a fresh one, so keys this build does
@@ -155,6 +161,52 @@ def sort_order_index(value: object) -> int:
 
 def pool_index(value: object) -> int:
     return _choice_index(POOL_CHOICES, value, 0)
+
+
+# -- the folder picker's outcome ----------------------------------------
+
+#: `AppKit.NSModalResponseOK`, restated here rather than imported —
+#: this module's whole premise is that it is testable without AppKit.
+#: Restating a constant is a drift risk, and drift would not be subtle:
+#: every Choose would be silently rejected, which is this app's worst
+#: failure shape. So `test_folder_sheet.py` imports AppKit and asserts
+#: the two are equal, exactly as `first_run_state`'s resolve strategies
+#: are pinned against `display_target`. The check lives in the test,
+#: where AppKit is allowed to be a soft dependency, not in the import
+#: graph.
+MODAL_RESPONSE_OK = 1
+
+
+def sheet_folder_choice(
+    *, response: int, path: str | None, still_editing: bool
+) -> str | None:
+    """The folder a picker's outcome adopts, or `None` to adopt nothing.
+
+    Both windows open the folder picker as a **sheet**, so the code that
+    reacts to it runs in a completion handler *later* rather than inline
+    after `runModal()`. Three of the four ways to adopt nothing were
+    early `return`s in the old inline body; the fourth is new, and is
+    only new because the mechanism changed:
+
+    * ``response`` is anything but OK — the user cancelled.
+    * ``path`` is `None` — the panel reported no URL at all.
+    * ``still_editing`` is `False` — **the window that asked the question
+      is gone, or has moved on to another step, by the time the answer
+      arrives.** A modal run loop made that impossible for free: nothing
+      else could run while it spun. A sheet gives that guarantee up, so
+      the caller has to state it, and this is where it is stated.
+
+    The empty string is deliberately *not* rejected: the pre-conversion
+    code adopted whatever the panel's path was, and this is a mechanism
+    change, not a behaviour change.
+    """
+    if not still_editing:
+        return None
+    if response != MODAL_RESPONSE_OK:
+        return None
+    if path is None:
+        return None
+    return str(path)
 
 
 # -- the form ----------------------------------------------------------
@@ -827,6 +879,7 @@ __all__ = [
     "DEFAULT_INTERVAL_S",
     "INTERVAL_CHOICES",
     "MAX_PROBE_BYTES",
+    "MODAL_RESPONSE_OK",
     "ORDER_CHOICES",
     "POOL_CHOICES",
     "PROBE_TIMEOUT_S",
@@ -853,6 +906,7 @@ __all__ = [
     "probe_json_url",
     "schedule_from_fields",
     "settings_document",
+    "sheet_folder_choice",
     "sort_order_index",
     "status_lines",
 ]

@@ -510,8 +510,18 @@ class CalibrationDocumentTests(unittest.TestCase):
         from display import paths
 
         bundled = read_json_object(paths.bundled_calibration_path(), "calibration")
-        if not bundled:
-            self.skipTest("no bundled calibration to merge into")
+        # 🔴 An assertion rather than a `skipTest`, for the reason
+        # `test_release_gate`'s version check now carries: the bundled
+        # calibration is **shipped in the bundle** and named on the
+        # manifest, so its absence is a packaging regression, not a
+        # reason to stop checking. As a skip, deleting the file would
+        # have turned this test green and silent.
+        self.assertTrue(
+            bundled,
+            f"no bundled calibration at {paths.bundled_calibration_path()} — "
+            f"it ships with the app, so this is a packaging failure rather "
+            f"than a reason to skip the merge check",
+        )
         document = fr.calibration_document(bundled, "1552-8-0")
         parsed = cal.validate_calibration(document)
         self.assertIsNotNone(parsed, "merged bundled calibration must validate")

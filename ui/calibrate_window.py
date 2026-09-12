@@ -56,6 +56,12 @@ from display.calibration import load_calibration_resolved
 from display.config_store import read_json_object
 from display.display_target import get_view_screen
 from ui import calibrate_state as cs
+from ui import notice_window
+
+#: The one advisory this window shows before it has a window of its own.
+#: Namespaced against `notice_window._SLOTS`, which every advisory site
+#: shares. See `CalibrateController._advise`.
+ADVISORY_NO_VIEW = "calibrate.no_view"
 
 #: How often the overlay re-reads nothing at all — it does not poll. The
 #: overlay redraws when the session changes, which is the only time it
@@ -369,7 +375,23 @@ class CalibrateController(AppKit.NSObject):
             # opening a calibration window with nothing to calibrate
             # against is how someone ends up nudging numbers for a
             # minute before noticing.
-            self._alert(
+            # 🔴 `_advise`, not `_alert`, and this is the ONE site in this
+            # file that must not be modal. Every other alert here is put
+            # up by a window that is already on screen; this one fires
+            # **before `_overlay` and `_window` exist** and then returns
+            # False, at which point `menubar.calibrate_` drops this
+            # controller. There is nothing on screen to own a modal, so
+            # if `activateIgnoringOtherApps_` fails — which Apple reports
+            # it intermittently does on macOS 26 — the alert opens behind
+            # every other window with no visible owner, and its
+            # `runModal()` holds the *menu bar's* run loop until someone
+            # finds it. That is the exact shape of 2026-09-08.
+            #
+            # The plan's Phase 5 puts this file wholly in the "left alone,
+            # its alerts are owned by a window already on screen" bucket.
+            # For this call site that is factually wrong; for the other
+            # three it is right.
+            self._advise(
                 "The View isn't connected.",
                 "Plug the View back in and open Adjust the circle again.",
             )
@@ -951,7 +973,49 @@ class CalibrateController(AppKit.NSObject):
     # -- helpers -------------------------------------------------------
 
     @objc.python_method
+    def _advise(self, message: str, informative: str) -> None:
+        """Say one thing with **no window of ours on screen** to own it.
+
+        A non-modal panel, because the only caller is `start()`'s
+        "the View isn't connected" path, which runs before either window
+        is built. Nothing here is held: this controller is about to be
+        dropped by its caller, so `notice_window` keeps the panel alive
+        itself — that is what its module-level hold exists for, and this
+        is the caller that cannot do it.
+
+        🔴 **It passes a SLOT, and without one this site stacked panels
+        faster than any other in the app.** MEASURED: four clicks on
+        *Adjust the circle* with the View unplugged gave **four** panels,
+        each needing its own close. The modal made that impossible. Two
+        things conspire — `menubar.calibrate_` clears its `_calibrate`
+        re-entry guard when `start()` returns False, so the menu item is
+        immediately clickable again, and this controller is dropped, so
+        it cannot remember anything itself. The slot table is in
+        `notice_window` for exactly that reason.
+
+        ⚠️ **`ui.calibrate_window.main()` — the developer CLI — now
+        reports this on stderr rather than in a dialog.** It returns 1
+        without ever reaching `app.run()`, so a non-modal window has no
+        run loop to be shown in. `notice_state.advisory_log_line` writes
+        the same words to stderr, which is the right medium for a command
+        line anyway; the menu bar path, which is the one users take, has
+        a run loop and shows the window.
+        """
+        notice_window.advise(message, informative, slot=ADVISORY_NO_VIEW)
+
+    @objc.python_method
     def _confirm_close(self) -> str:
+        """Save / Discard / Cancel, and it **must stay `runModal()`**.
+
+        🔴 **Its return value drives behaviour** — the caller branches on
+        save, discard or cancel — so the call has to block until the user
+        answers. Everything Phase 5 converted was a one-button
+        acknowledgement whose result nobody read; this is the one alert
+        in this app that asks a question. A non-modal panel here would
+        have to grow a completion handler and split `_close` in two, and
+        the window that owns it *is* on screen, which is the case the
+        phase deliberately left alone.
+        """
         alert = AppKit.NSAlert.alloc().init()
         alert.setMessageText_("Save the circle you adjusted?")
         alert.setInformativeText_(

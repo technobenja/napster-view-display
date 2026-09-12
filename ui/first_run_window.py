@@ -67,6 +67,13 @@ class FirstRunController(AppKit.NSObject):
         self._monitor = None
         self._testing = False
         self._test_token = 0
+        #: The folder picker while its sheet is up, else `None`.
+        #: `chooseFolder_` explains what depends on it.
+        self._panel = None
+        #: The advisory alert while **its** sheet is up, else `None`.
+        #: A second sheet type on the same window, so it needs the same
+        #: Esc guard for the same reason — see `_install_key_monitor`.
+        self._alert_sheet = None
         self._saved = False
         return self
 
@@ -577,18 +584,102 @@ class FirstRunController(AppKit.NSObject):
             print(f"controlTextDidChange_:\n{traceback.format_exc()}", file=sys.stderr)
 
     def chooseFolder_(self, sender) -> None:
+        """Open the folder picker as a **sheet** on this window.
+
+        `beginSheetModalForWindow:completionHandler:`, never
+        `runModal()`, for the reason `settings_window.chooseFolder_`
+        documents at length: a modal run loop freezes `ui_heartbeat_at`
+        for as long as the panel is up, and on macOS 26 a panel can open
+        behind every other window. This is the flow that matters most —
+        it is the first thing a new user does, and a picker they cannot
+        see here is indistinguishable from an app that will not start.
+
+        **The call returns immediately.** Everything that used to run
+        inline after `runModal()` lives in `_folder_chosen`.
+        """
         try:
+            window = self._window
+            if window is None:
+                return
             panel = AppKit.NSOpenPanel.openPanel()
             panel.setCanChooseFiles_(False)
             panel.setCanChooseDirectories_(True)
             panel.setAllowsMultipleSelection_(False)
             panel.setPrompt_("Choose")
-            if panel.runModal() != AppKit.NSModalResponseOK:
-                return
+            # Held for the sheet's lifetime — see
+            # `settings_window.chooseFolder_`, which documents both
+            # reasons: the Esc guard, and pyobjc premature release.
+            self._panel = panel
+            try:
+                panel.beginSheetModalForWindow_completionHandler_(
+                    window, lambda response: self._folder_chosen(panel, response)
+                )
+            except Exception:
+                # `_folder_chosen` is the only other place that clears
+                # `_panel`, and it never runs if this raises. Leaving the
+                # reference set would disable Esc on this window for the
+                # rest of its life, silently, with a traceback on a
+                # stderr nobody reads. The assignment stays *before* the
+                # call: if AppKit ever invoked the handler inline,
+                # assigning after would clobber the handler's own clear.
+                self._panel = None
+                raise
+        except Exception:
+            print(f"chooseFolder_:\n{traceback.format_exc()}", file=sys.stderr)
+
+    @objc.python_method
+    def _folder_chosen(self, panel, response) -> None:
+        """The second half of `chooseFolder_`, run when the sheet closes.
+
+        Its own `try/except`: this is an AppKit callback, so nothing
+        raised here can reach `chooseFolder_`'s handler.
+
+        **The step check is not defensive padding — it restores an
+        invariant the modal loop used to provide for free.** While
+        `runModal()` spun, no other code in this process could run, so
+        the flow could not possibly have left `PICTURES` between the
+        click and the answer. A sheet does not spin a loop, so that has
+        to be asserted rather than assumed; `_show_step` rebuilds
+        `_controls` wholesale, and adopting a folder into a step the user
+        has already moved past would edit a form nobody is looking at.
+        """
+        try:
+            # First, and before any early return — see
+            # `settings_window._folder_chosen` for why this does not
+            # depend on when AppKit dismisses the sheet.
+            panel.orderOut_(None)
+            if self._panel is panel:
+                self._panel = None
             url = panel.URL()
-            if url is None:
+            folder = ss.sheet_folder_choice(
+                response=int(response),
+                # `str(url.path())` exactly as the inline version had it.
+                path=None if url is None else str(url.path()),
+                still_editing=(
+                    # 🔵 **CORRECTED. This said the two halves were
+                    # redundant by construction and told the next reader
+                    # not to test them — and named their reachability in
+                    # its own previous sentence.** `_finish` sets
+                    # `_closing = True`, then calls `removeMonitor_` and
+                    # `orderOut_`, **either of which can raise**, and only
+                    # then sets `_window = None`; it has no `try` of its
+                    # own. So `_closing=True, _window is not None` is
+                    # precisely the state a raise in teardown leaves
+                    # behind, and it is the state a live sheet's
+                    # completion handler is then dispatched into.
+                    #
+                    # Both halves were mutation survivors because every
+                    # test reached this state through `_finish`, which
+                    # sets both. `ui/test_folder_sheet.TornDownWindowTests`
+                    # now drives each on its own and both are killed.
+                    not self._closing
+                    and self._window is not None
+                    and self._flow.step is fr.Step.PICTURES
+                ),
+            )
+            if folder is None:
                 return
-            self._flow.form.folder = str(url.path())
+            self._flow.form.folder = folder
             self._invalidate_test()
             self._sync()
             # The panel is also what grants folder access, so this
@@ -596,7 +687,7 @@ class FirstRunController(AppKit.NSObject):
             # the answer is most useful.
             self.testSource_(None)
         except Exception:
-            print(f"chooseFolder_:\n{traceback.format_exc()}", file=sys.stderr)
+            print(f"_folder_chosen:\n{traceback.format_exc()}", file=sys.stderr)
 
     # -- actions: Test ---------------------------------------------------
 
@@ -730,7 +821,7 @@ class FirstRunController(AppKit.NSObject):
         """The two durable writes, both atomic merges, same as Save. Returns whether it succeeded."""
         source = self._flow.to_source()
         if source is None:
-            self._alert(
+            self._advise(
                 "That source isn't complete.",
                 "Fill in the option under the row you picked, then press Test.",
             )
@@ -744,9 +835,12 @@ class FirstRunController(AppKit.NSObject):
             atomic_write_json(path, document)
         except OSError:
             print(f"first_run: save failed:\n{traceback.format_exc()}", file=sys.stderr)
-            self._alert(
+            self._advise(
                 "Couldn't save your settings.",
-                f"Nothing was changed. Could not write {path}.",
+                f"Nothing was changed, and setup can't continue until this "
+                f"succeeds. ImageView could not write {path} — usually a full "
+                f"disk, or a folder it isn't allowed to write to. Fix that and "
+                f"press Next to try again.",
             )
             return False
 
@@ -832,6 +926,24 @@ class FirstRunController(AppKit.NSObject):
             try:
                 if (
                     self._window is not None
+                    # A live folder sheet owns Esc. Without this, an Esc
+                    # that reached here would run `_finish`, order the
+                    # window out and drop it — leaving a sheet attached
+                    # to a window that no longer exists, which is a hang
+                    # shape, in the phase whose whole purpose is to
+                    # remove one. The `isKeyWindow()` test below is
+                    # *expected* to be False while a sheet is up, but
+                    # that is an inference about AppKit's key window and
+                    # this does not rest on it.
+                    and self._panel is None
+                    # 🔴 And the advisory sheet, added in Phase 5. It is
+                    # a second sheet on the same window and carries the
+                    # identical hazard: an Esc that reached `_finish`
+                    # would order this window out and drop it, leaving a
+                    # sheet attached to a window that no longer exists.
+                    # A new sheet type with no clause here silently
+                    # reintroduces the hang shape Phase 3 removed.
+                    and self._alert_sheet is None
                     and self._window.isKeyWindow()
                     and event.keyCode() == KEY_CODE_ESCAPE
                 ):
@@ -849,12 +961,82 @@ class FirstRunController(AppKit.NSObject):
         )
 
     @objc.python_method
-    def _alert(self, message: str, informative: str) -> None:
+    def _advise(self, message: str, informative: str) -> None:
+        """Say one thing as a **sheet on this window**, never `runModal()`.
+
+        🔴 **This was `_alert`, and it was the worst of the five
+        `runModal()` sites even though it looks like the tamest.** It had
+        no preceding `activateIgnoringOtherApps_` at all — the two in
+        `settings_window` and `calibrate_window` at least ask — so on any
+        build where this app is not already frontmost the alert could
+        open behind another window, with a modal run loop holding the
+        menu bar and nothing on screen to explain it. In the app's first
+        two minutes, to someone who has never seen it work.
+
+        ⚠️ **A sheet, not the non-modal panel the other conversions
+        use, and the plan's reasoning for this site is wrong.** Phase 5
+        groups this with "the sites reachable when the app has no visible
+        window". It is not one: both callers are inside `_persist`, which
+        is reached only from `goNext_`, a button on this very window.
+        Being window-owned is exactly what makes a sheet available, and a
+        sheet is the better fit here for three reasons a floating panel
+        cannot match — it cannot be lost behind anything, it is
+        window-modal so the flow stays byte-identical to the alert's
+        (nobody can type into the step behind it), and a 360pt panel
+        centred on screen would land on top of the centred first-run
+        window, covering the very row the first message names.
+
+        A sheet spins **no nested run loop**, which is the property
+        Phase 3 established when it converted this file's folder picker,
+        so `ui_heartbeat_at` keeps beating for as long as this is up.
+
+        **The call returns immediately**, which `runModal()` did not.
+        Both callers return False straight afterwards and nothing reads a
+        result, so the sequence is unchanged; a new caller must check its
+        own.
+        """
+        # To the log either way, and first. This app writes to stderr and
+        # nowhere else, and the alert this replaced left
+        # no trace at all — so "it said it couldn't save my settings" was
+        # unanswerable afterwards. Newlines collapsed: one event, one
+        # line, in an append-only log.
+        print(
+            f"first_run: {message} {' '.join(informative.split())}",
+            file=sys.stderr,
+        )
+        window = self._window
+        if window is None:
+            return
         alert = AppKit.NSAlert.alloc().init()
         alert.setMessageText_(message)
         alert.setInformativeText_(informative)
         alert.addButtonWithTitle_("OK")
-        alert.runModal()
+        # Held for the sheet's lifetime, for both of the reasons
+        # `chooseFolder_` documents: the Esc guard below, and pyobjc
+        # releasing an object AppKit is still using. Assigned *before*
+        # the call, so that a handler invoked inline could not have its
+        # own clear clobbered.
+        self._alert_sheet = alert
+        try:
+            alert.beginSheetModalForWindow_completionHandler_(
+                window, lambda response: self._advice_dismissed(alert)
+            )
+        except Exception:
+            self._alert_sheet = None
+            raise
+
+    @objc.python_method
+    def _advice_dismissed(self, alert) -> None:
+        """The sheet closed. An AppKit callback, so it owns its own
+        `try`: nothing raised here may reach `_advise`'s handler."""
+        try:
+            if self._alert_sheet is alert:
+                self._alert_sheet = None
+        except Exception:  # noqa: BLE001 - an AppKit callback
+            print(
+                f"first_run: advice dismissed:\n{traceback.format_exc()}",
+                file=sys.stderr,
+            )
 
 
 __all__ = ["FirstRunController"]

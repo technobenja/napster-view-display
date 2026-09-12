@@ -95,8 +95,23 @@ echo "  interpreter: $VIEWLAB_PYTHON ($("$VIEWLAB_PYTHON" --version 2>&1))"
 "$VIEWLAB_PYTHON" -m venv "$VENV"
 # Deliberately NOT the `pyobjc` umbrella: modulegraph would chase ~200
 # framework wrappers (~70MB) into the bundle (§6.5).
+#
+# 🔴 **This list must cover every name in setup.py's `PYOBJC_MODULES`.**
+# py2app's `includes:` does not install anything and does not fail on a
+# name it cannot import — it silently omits it. `Quartz` was listed in
+# `includes` from Phase 4a and never installed here, so every build from
+# v1.1.0 to v1.1.5 shipped ZERO Quartz (verified against the installed
+# bundle: `lib-dynload/Quartz` absent, `objc`/`AppKit`/`Foundation`
+# present). Both lazy `import Quartz` sites therefore returned their
+# not-available value in every shipped copy: `ui/contention.py`'s window
+# evidence was permanently "the window server could not be consulted",
+# and `display/display_target.py`'s `stable_display_id()` returned ""
+# which silently disabled "explicitly choose which display is the View".
+# A declaration that looks effective, is not, and raises nothing. Gate 3b
+# now checks this rather than trusting the two lists to stay in step.
 "$VENV/bin/pip" install --quiet --upgrade pip
-"$VENV/bin/pip" install --quiet py2app pyobjc-core pyobjc-framework-Cocoa httpx
+"$VENV/bin/pip" install --quiet py2app pyobjc-core pyobjc-framework-Cocoa \
+  pyobjc-framework-Quartz httpx
 "$VENV/bin/python" -c "import py2app; print('py2app', py2app.__version__)"
 
 # ---------------------------------------------------------------------
@@ -129,7 +144,7 @@ echo "  interpreter: $VIEWLAB_PYTHON ($("$VIEWLAB_PYTHON" --version 2>&1))"
 # manifest tracked-ness cannot be checked (it is asserted in the dev
 # repo). Everything else runs, so the manifest, HARD-term and
 # SOFT-exception checks all run against the exact tree being packaged.
-say "gate 0/7: test suite (against \$SRC, before the prune removes it)"
+say "gate 0/8: test suite (against \$SRC, before the prune removes it)"
 TESTLOG="$BUILD_ROOT/tests.log"
 if ! (cd "$SRC" && PYTHONDONTWRITEBYTECODE=1 "$VENV/bin/python" \
         -m unittest discover -t . -s . -p "test_*.py") \
@@ -211,7 +226,7 @@ codesign --force --deep --sign - "$APP"
 # ---------------------------------------------------------------------
 # 7. VERIFY — §6.5 gates. These fail the build; they do not warn.
 # ---------------------------------------------------------------------
-say "gate 1/7: no /opt/homebrew linkage in lib-dynload"
+say "gate 1/8: no /opt/homebrew linkage in lib-dynload"
 # If macholib misses one (most often _ssl, _sqlite3, _hashlib) it fails
 # only on a machine without Homebrew — i.e. every recipient — and it
 # fails on HTTPS, which is the whole point of the URL sources.
@@ -220,7 +235,7 @@ BREW_COUNT="$(otool -L "$APP"/Contents/Resources/lib/python*/lib-dynload/*.so 2>
 echo "  /opt/homebrew references: $BREW_COUNT"
 [ "$BREW_COUNT" -eq 0 ] || fail "$BREW_COUNT Homebrew dylib references in lib-dynload"
 
-say "gate 2/7: whole-bundle binary-aware identity sweep (§11 assertion 4)"
+say "gate 2/8: whole-bundle binary-aware identity sweep (§11 assertion 4)"
 # Delegated to `release_gate.py` rather than reimplemented here. This
 # script used to carry its own narrower grep, and the two checks drifted
 # — which is exactly how §11's original wording ended up certifying a
@@ -258,7 +273,7 @@ fi
 "$VENV/bin/python" "$REPO/release_gate.py" --sweep-bundle "$APP" \
   || fail "first-party identity leak in the bundle"
 
-say "gate 3/7: every first-party module is actually in the bundle"
+say "gate 3/8: every first-party module is actually in the bundle"
 # setup.py names modules explicitly (see its docstring). A hand-kept
 # list silently rots: modulegraph does not follow a lazy import, so a
 # module that moves behind one — as `ui.calibrate_window` already has —
@@ -299,10 +314,51 @@ if [ -n "$MISSING" ]; then
 fi
 echo "  all first-party modules present"
 
-say "gate 4/7: --selftest from inside the bundle"
+say "gate 3b/8: every pyobjc framework setup.py DECLARES is actually in the bundle"
+# py2app's `includes:` neither installs a module nor fails on one it
+# cannot import — it silently omits it. So setup.py's PYOBJC_MODULES and
+# the pip line at the top of this script are two lists that must agree,
+# with nothing checking that they do. They did not agree for six
+# releases: `Quartz` was declared and never installed, and the only
+# symptom was two features quietly returning their not-available value
+# on every machine in the world.
+#
+# Gate 3 above cannot catch this — it walks the build tree's own .py
+# files, and a third-party framework is not in the build tree.
+#
+# The list is READ FROM setup.py, never repeated here. A gate carrying
+# its own copy of the thing it checks drifts from it, which is the exact
+# failure being gated.
+DYNLOAD="$PYLIB/lib-dynload"
+PYOBJC_NAMES="$("$VENV/bin/python" - "$SRC/packaging/setup.py" <<'PYEOF_INNER'
+import ast, sys
+tree = ast.parse(open(sys.argv[1]).read())
+for node in ast.walk(tree):
+    if isinstance(node, ast.Assign) and any(
+        getattr(t, "id", "") == "PYOBJC_MODULES" for t in node.targets
+    ):
+        print(" ".join(ast.literal_eval(node.value)))
+        break
+else:
+    sys.exit("could not find PYOBJC_MODULES in setup.py")
+PYEOF_INNER
+)" || fail "gate 3b could not parse PYOBJC_MODULES out of setup.py"
+# An empty read would make the loop below iterate zero times and report
+# success — the vacuous-pass shape this project keeps finding.
+[ -n "$PYOBJC_NAMES" ] || fail "gate 3b read an EMPTY PYOBJC_MODULES — it is checking nothing"
+echo "  declared: $PYOBJC_NAMES"
+for m in $PYOBJC_NAMES; do
+  [ -e "$DYNLOAD/$m" ] || fail "setup.py declares pyobjc module '$m', but $DYNLOAD/$m is absent.
+       py2app dropped it silently because the build venv cannot import it.
+       Add the matching pyobjc-framework-* wheel to the pip line near the
+       top of this script."
+done
+echo "  all declared pyobjc frameworks present in lib-dynload"
+
+say "gate 4/8: --selftest from inside the bundle"
 "$APP/Contents/MacOS/ImageView" --selftest || fail "selftest failed"
 
-say "gate 5/7: signature"
+say "gate 5/8: signature"
 codesign --verify --deep --strict --verbose=2 "$APP"
 
 # ---------------------------------------------------------------------
@@ -320,7 +376,7 @@ find "$STAGE" -name .DS_Store -delete
 rm -f "$DMG"
 hdiutil create -volname "ImageView" -srcfolder "$STAGE" -ov -format UDZO -quiet "$DMG"
 
-say "gate 6/7: sweep the .dmg itself (the thing that actually ships)"
+say "gate 6/8: sweep the .dmg itself (the thing that actually ships)"
 # This gate runs LAST because it is the only one that can: every earlier
 # check ran against an *input* to the artifact, and the artifact did not
 # exist until the line above. The .app was swept, then copied, staged,

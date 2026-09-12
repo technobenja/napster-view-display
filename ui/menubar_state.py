@@ -55,6 +55,7 @@ from __future__ import annotations
 import dataclasses
 import enum
 import json
+import math
 import time
 from collections.abc import Mapping
 from pathlib import Path
@@ -83,6 +84,30 @@ STALE_AFTER_S = 5.0
 # comment counts ~345,000 write-and-rename pairs a day on a machine meant
 # to sit quietly in someone's home for years.
 UI_HEARTBEAT_INTERVAL_S = 2.0
+
+# The threshold for *accusing* the menu bar of not responding, as
+# distinct from the one that picks a menu title. Read only by
+# `ui/contention_state.py`.
+#
+# It is deliberately not STALE_AFTER_S. That constant is 5.0 against a
+# realized worst-case write gap of 2.4s, i.e. 0.2s of slack, and it is
+# tuned for a label that costs nothing when it flickers. This one drives
+# a sentence that tells a human their app is broken and names a pid to
+# force-quit, so it must not be the tight one.
+#
+# 20.0 costs nothing in responsiveness — the age is read instantly from a
+# stamp, never waited for — and the human who double-clicked did so
+# because nothing had happened for a while, so the fault is already older
+# than any transient. It is still well under the 51.2s an About box was
+# MEASURED to freeze this stamp for on 2026-09-10 — a reading taken
+# before v1.1.6 made that particular window non-modal, and one the
+# alerts still left modal in Settings and Adjust the circle can produce
+# just as easily. That is why nothing
+# downstream of it may act destructively: crossing this threshold is
+# necessary for the "not responding" verdicts and never sufficient on its
+# own. See `contention_state.classify`, where the window-server check is
+# what separates "modally busy in front of the user" from "wedged".
+UI_UNRESPONSIVE_AFTER_S = 20.0
 
 # The transient label sits in the menu bar for about three seconds
 # after the picture actually changes.
@@ -159,6 +184,33 @@ class Status:
     present: bool = False
 
 
+def _read_text(path: Path | str) -> str:
+    """Read a state file as text. Raises only `OSError`.
+
+    🔴 `errors="replace"`, and it is the whole point of this helper.
+    `Path.read_text()` with the default strict codec raises
+    `UnicodeDecodeError` on a file with one bad byte — and
+    `UnicodeDecodeError` is a **`ValueError`, not an `OSError`**, so it
+    sails straight through an `except OSError` written to make a reader
+    total. Both readers below promise in bold that they never raise, and
+    both did, on any `ui_status.json` or `status.json` containing a
+    single invalid byte. A half-written file interrupted by a crash is
+    exactly how that happens.
+
+    Replacing the bad bytes keeps the read total; the mangled text then
+    fails `json.loads` and lands on the degradation path that was always
+    meant to catch it. The callers' `UnicodeDecodeError` handlers are
+    gone with this, and they were provably dead anyway: `json.loads` can
+    only raise it when handed *bytes*, and it is handed a `str`.
+
+    Nine other `read_text()` calls in this project have the same shape.
+    They are outside this change and are not touched here; this one is
+    fixed because this phase put a new reader and a new tool in front of
+    it.
+    """
+    return Path(path).read_text(encoding="utf-8", errors="replace")
+
+
 def _as_float(value: object, default: float = 0.0) -> float:
     """`bool` is excluded explicitly — it is an `int` subclass in Python,
     and `{"heartbeat_at": true}` reading as 1.0 (i.e. 1970) would be a
@@ -176,11 +228,23 @@ def _as_float(value: object, default: float = 0.0) -> float:
 
 
 def _as_int(value: object, default: int = 0) -> int:
+    """`bool` is excluded for the same reason `_as_float` excludes it.
+
+    🔴 And non-finite floats are excluded explicitly, which is the thing
+    this function was missing while its sibling had it: JSON permits
+    `NaN` and `1e400`, `float("1e400")` is `inf`, and `int(inf)` raises
+    **OverflowError** while `int(nan)` raises **ValueError**. Neither is
+    an `OSError`, so both escaped every caller written to be total — and
+    this phase routes `ui_status.json`'s `pid` through here, which is a
+    number that decides which process gets a signal. The asymmetry with
+    `_as_float`, which has carried a NaN guard and a comment explaining
+    it, was the tell.
+    """
     if isinstance(value, bool):
         return default
     if isinstance(value, int):
         return value
-    if isinstance(value, float) and value == int(value):
+    if isinstance(value, float) and math.isfinite(value) and value == int(value):
         return int(value)
     return default
 
@@ -233,12 +297,12 @@ def read_status(path: Path | str) -> Status:
     matters to the menu.
     """
     try:
-        raw = Path(path).read_text()
+        raw = _read_text(path)
     except OSError:
         return Status()
     try:
         data = json.loads(raw)
-    except (json.JSONDecodeError, UnicodeDecodeError):
+    except json.JSONDecodeError:
         return Status()
     return parse_status(data)
 
@@ -257,36 +321,106 @@ def is_stale(heartbeat_at: float, now: float, threshold: float = STALE_AFTER_S) 
     return (now - heartbeat_at) > threshold
 
 
+@dataclasses.dataclass(frozen=True)
+class UiStatus:
+    """Everything `ui_status.json` carries, as the reader sees it.
+
+    **Every field is optional in the document and defaulted here**, in
+    both directions. A v1.1.5 menu bar writes only `ui_heartbeat_at`, so
+    a v1.1.6 reader must tolerate the other four being absent — that is
+    what the defaults are for. And a future version may add keys this
+    reader has never heard of, which it ignores rather than rejecting;
+    `read_ui_status` reads named keys and never enumerates the document.
+
+    `present` is "the file parsed as an object", not "the process is
+    healthy". A file with `present=True` and `heartbeat_at=0.0` is a
+    document that exists and carries no usable stamp.
+
+    The three process fields describe the process that **last served**,
+    which is exactly the point of putting them here rather than in the
+    lock file: the timer is the sole writer, so the file exists only
+    because something serviced a default-mode timer, and a *stale* file
+    then names the process that was serving when it stopped. That is the
+    question a diagnostician arrives with.
+
+    `stacks_armed` is the one field with a safety job. `SIGUSR1`'s
+    default disposition is **terminate**, and the handler that makes it a
+    diagnostic instead exists only from v1.1.3. Anything deciding whether
+    to signal this pid must read this field and must treat its absence as
+    False, or the "capture the evidence first" path kills the process it
+    was preserving.
+    """
+
+    heartbeat_at: float = 0.0
+    pid: int | None = None
+    exe: str | None = None
+    stacks_armed: bool = False
+    stacks_path: str | None = None
+    present: bool = False
+
+
+def read_ui_status(path: Path | str) -> UiStatus:
+    """Read and parse `ui_status.json`. **Never raises.**
+
+    Same degradation rule as `read_status`: absent, unreadable, truncated
+    mid-write, not JSON, or not an object all return the default record,
+    whose `heartbeat_at` of `0.0` makes `is_stale()` answer True. A
+    process whose heartbeat cannot be read is not one anything should
+    treat as serving.
+
+    One parser, not two. `read_ui_heartbeat` is implemented on top of
+    this rather than beside it — a second code path answering the same
+    question does not fail loudly when it drifts, it answers confidently
+    and differently (this project has the scar: a Settings *Test* button
+    that built its own request reported "no starred pictures" while fifty
+    of them were rotating on the glass).
+    """
+    try:
+        raw = _read_text(path)
+    except OSError:
+        return UiStatus()
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return UiStatus()
+    if not isinstance(data, Mapping):
+        return UiStatus()
+    pid = _as_int(data.get("pid"), default=0)
+    return UiStatus(
+        heartbeat_at=_as_float(data.get("ui_heartbeat_at")),
+        # A pid of 0 or below is not a pid anything may signal or look
+        # up, so it degrades to "the document did not say" rather than
+        # travelling onwards as a number.
+        pid=pid if pid > 0 else None,
+        exe=_as_optional_str(data.get("exe")),
+        stacks_armed=_as_bool(data.get("stacks_armed")),
+        stacks_path=_as_optional_str(data.get("stacks_path")),
+        present=True,
+    )
+
+
 def read_ui_heartbeat(path: Path | str) -> float:
     """The menu bar's own `ui_heartbeat_at`, or `0.0`. Never raises.
 
-    `0.0` covers every "I cannot tell" — the file is absent, unreadable,
-    truncated mid-write, not JSON, not an object, or carries a hostile
-    type — and `is_stale(0.0, now)` is `True`, which is the answer that
-    matters: a process whose heartbeat cannot be read is not one anything
-    should treat as serving. Same degradation rule as `read_status`, and
-    `_as_float` is shared with it so a NaN or a `true` cannot read as a
-    timestamp here either.
-
-    Deliberately a bare float rather than a `Status`-style record. There
-    is exactly one field, and the only question anyone asks of it is the
-    one `is_stale()` answers.
+    A bare float, deliberately: callers that only want to ask
+    `is_stale()` should not have to hold a record to do it. Anything
+    needing the pid, the executable or the stack-dump state reads
+    `read_ui_status` instead — this is that record's `heartbeat_at` and
+    nothing more.
     """
-    try:
-        raw = Path(path).read_text()
-    except OSError:
-        return 0.0
-    try:
-        data = json.loads(raw)
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        return 0.0
-    if not isinstance(data, Mapping):
-        return 0.0
-    return _as_float(data.get("ui_heartbeat_at"))
+    return read_ui_status(path).heartbeat_at
 
 
-def write_ui_heartbeat(path: Path | str, now: float | None = None) -> bool:
-    """Stamp `ui_heartbeat_at` into `ui_status.json`. **Never raises.**
+def write_ui_heartbeat(
+    path: Path | str,
+    now: float | None = None,
+    *,
+    pid: int | None = None,
+    exe: str | None = None,
+    stacks_armed: bool | None = None,
+    stacks_path: str | None = None,
+) -> bool:
+    """Stamp `ui_status.json`. **Never raises.**
 
     That is not a nicety, it is the whole safety argument for putting
     this on a live timer. `display/app.py` considered and explicitly
@@ -302,27 +436,48 @@ def write_ui_heartbeat(path: Path | str, now: float | None = None) -> bool:
     produce and reports by return value, the same contract
     `control.write_control` and `app.merge_status` already follow.
     `OSError` is the live one — a full or read-only disk, a directory
-    where the file should be. `TypeError` / `ValueError` **cannot arise
-    from this caller today**: `menubar._write_ui_heartbeat` passes
-    `time.time()`, which json can always encode. They are caught anyway
-    so that a future field added to this document cannot turn a heartbeat
-    into a crash; `merge_status` has the same pair for the same reason,
-    and got them after an unserializable status value escaped into a
-    caller's broad except and discarded an entirely successful poll.
+    where the file should be. `TypeError` / `ValueError` cannot arise
+    from the app's caller today, and are caught anyway so that a future
+    field added to this document cannot turn a heartbeat into a crash;
+    `merge_status` has the same pair for the same reason, and got them
+    after an unserializable status value escaped into a caller's broad
+    except and discarded an entirely successful poll. **That argument is
+    no longer hypothetical here**: `exe` and `stacks_path` are strings
+    this function is handed by a caller, and a caller that hands it
+    something else gets `False` rather than a dead run loop.
 
-    Written whole, not merged into whatever is already on disk the way
-    `merge_status` does. There is one field and one writer, so a
+    **The four optional fields are omitted when they are None**, so a
+    caller that passes only a timestamp writes byte-for-byte what v1.1.5
+    wrote. That keeps the no-information case honest — an absent `pid`
+    means "nobody said", never "pid null" — and keeps this function
+    usable from a test that is only interested in staleness.
+
+    Still written whole, not merged into whatever is already on disk the
+    way `merge_status` does. There is one writer, so a
     read-modify-write would buy nothing and cost a read every 2 seconds
     — and a merge would faithfully preserve a stale key written by some
     future version, which is the opposite of what a heartbeat wants.
+    **With five fields instead of one, whole-file writing is what keeps
+    them consistent**: the pid and the stamp are true of the same
+    instant, and a reader can never catch a new stamp against a previous
+    process's pid.
 
     The write is atomic (temp file + `os.replace`) for the same reason
-    `status.json`'s is: a reader that catches a half-written file would
+    `status.json`'s is: a reader that caught a half-written file would
     read `0.0` and report a healthy process as dead.
     """
     moment = time.time() if now is None else now
+    document: dict[str, Any] = {"ui_heartbeat_at": moment}
+    if pid is not None:
+        document["pid"] = pid
+    if exe is not None:
+        document["exe"] = exe
+    if stacks_armed is not None:
+        document["stacks_armed"] = stacks_armed
+    if stacks_path is not None:
+        document["stacks_path"] = stacks_path
     try:
-        atomic_write_json(Path(path), {"ui_heartbeat_at": moment})
+        atomic_write_json(Path(path), document)
     except (OSError, TypeError, ValueError):
         return False
     return True
@@ -666,9 +821,11 @@ __all__ = [
     "STALE_AFTER_S",
     "TITLE_HOLD_S",
     "UI_HEARTBEAT_INTERVAL_S",
+    "UI_UNRESPONSIVE_AFTER_S",
     "State",
     "Status",
     "TitleTracker",
+    "UiStatus",
     "command_advance",
     "command_refresh",
     "command_set_blanked",
@@ -678,6 +835,7 @@ __all__ = [
     "parse_status",
     "read_status",
     "read_ui_heartbeat",
+    "read_ui_status",
     "setup_needed",
     "title_for",
     "truncate_label",

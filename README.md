@@ -56,7 +56,7 @@ shasum -a 256 ~/Downloads/ImageView.dmg
 ```
 
 ```
-SHA-256 (ImageView.dmg) = 5f72c52dc2c96e5334ca01740072af8329742916d3a071ada81d94ba2cda943d
+SHA-256 (ImageView.dmg) = f8a285673ed5d569539a90892a29e26c0d5c33fc59f51a6e7265d354081f4d7d
 ```
 
 If that does not match, do not open it.
@@ -189,6 +189,12 @@ The badge at the top is that same suite, run on a clean checkout by GitHub
 Actions on macOS. It is a narrow claim: it does not build the app, does not
 check the release artifact, and cannot see the display. A green badge means
 the unit tests passed — nothing about whether a build is fit to ship.
+
+A CI runner also has **no window server**, so the tests that ask macOS what a
+process has on screen — and the tests that build the window a second launch
+shows you — are skipped there, loudly, with the reason attached. A green badge
+has checked neither. Run the suite from a graphical login session if you want
+that half covered.
 
 ## Layout
 

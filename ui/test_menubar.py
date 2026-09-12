@@ -165,7 +165,7 @@ class UiHeartbeatTimerTests(unittest.TestCase):
         self.path.mkdir()  # unwritable: a directory where the file goes
         calls: list[float] = []
 
-        def counting(path, now=None):
+        def counting(path, now=None, **process_fields):
             calls.append(now)
             return False
 
@@ -313,8 +313,49 @@ class UiHeartbeatTimerTests(unittest.TestCase):
         location — not from a string built here."""
         self.at(1000.0)
         self.assertEqual(
-            json.loads(self.path.read_text()), {"ui_heartbeat_at": 1000.0}
+            json.loads(self.path.read_text())["ui_heartbeat_at"], 1000.0
         )
+
+    def test_the_record_names_the_process_that_served(self):
+        """The stamp alone says *something* served; these four say
+        *what*, which is the question a diagnostician arrives with when
+        the file is stale. The timer is still the sole writer, so the
+        file existing at all remains proof that a default-mode timer
+        fired."""
+        with patch.object(
+            menubar.diagnostics, "armed_stacks_path", return_value=Path("/tmp/s.log")
+        ):
+            self.at(1000.0)
+        self.assertEqual(
+            json.loads(self.path.read_text()),
+            {
+                "ui_heartbeat_at": 1000.0,
+                "pid": menubar.os.getpid(),
+                "exe": self.controller._own_exe,
+                "stacks_armed": True,
+                "stacks_path": "/tmp/s.log",
+            },
+        )
+
+    def test_an_unarmed_process_says_so_rather_than_staying_silent(self):
+        """🔴 The safety field. `SIGUSR1`'s default disposition is
+        terminate and the handler exists only from v1.1.3, so an arriving
+        instance that cannot see `stacks_armed: false` has to guess — and
+        guessing wrong kills the process it was trying to preserve.
+        A holder that did not arm must say `false`, not omit the key."""
+        with patch.object(menubar.diagnostics, "armed_stacks_path", return_value=None):
+            self.at(1000.0)
+        document = json.loads(self.path.read_text())
+        self.assertIs(document["stacks_armed"], False)
+        self.assertNotIn("stacks_path", document)
+
+    def test_the_record_is_written_whole_so_the_pid_matches_the_stamp(self):
+        """One atomic write, never a merge: a reader must not be able to
+        catch a fresh timestamp against a previous process's pid."""
+        self.at(1000.0)
+        self.path.write_text(json.dumps({"ui_heartbeat_at": 1.0, "pid": 424242}))
+        self.at(1000.0 + 10 * ms.UI_HEARTBEAT_INTERVAL_S)
+        self.assertEqual(json.loads(self.path.read_text())["pid"], menubar.os.getpid())
 
 
 class _ModeCounter(AppKit.NSObject):
@@ -342,8 +383,10 @@ class RunLoopModeContractTests(unittest.TestCase):
 
     * it is what lets a stale `ui_heartbeat_at` detect a modal wedge, the
       leading suspect for the 2026-09-08 incident;
-    * it is why an open file picker also looks stale, which is why nothing
-      may act destructively on staleness alone.
+    * it is why an open menu or alert also looks stale, which is why
+      nothing may act destructively on staleness alone. (The file picker
+      was the worst case of this and is no longer an instance of it: it
+      is a sheet, and spins no nested run loop.)
 
     Neither claim is safe to leave in a comment. Note the positive control
     in the first test: without it a mode test passes for the uninteresting
@@ -375,8 +418,7 @@ class RunLoopModeContractTests(unittest.TestCase):
     def test_a_scheduled_timer_does_not_fire_while_a_modal_is_up(self):
         """`runModal()` spins the loop in this mode. This is the property
         that makes a wedged modal detectable — and it is also why the
-        About box and `NSOpenPanel.runModal()` in the setup flow go stale
-        while working perfectly."""
+        About box goes stale while working perfectly."""
         self.assertEqual(self._fires_in(AppKit.NSModalPanelRunLoopMode), 0)
 
     def test_a_scheduled_timer_does_not_fire_while_a_menu_is_open(self):
@@ -422,6 +464,181 @@ class TimerRegistrationTests(unittest.TestCase):
         moved or the comment was deleted, not that the code is safe."""
         source = (Path(__file__).resolve().parent / "menubar.py").read_text()
         self.assertIn("NSRunLoopCommonModes", source)
+
+
+class MainGuardTests(unittest.TestCase):
+    """🔴 `main()` returns **0 in every branch**.
+
+    `KeepAlive {SuccessfulExit: false}` respawns a non-zero exit, so any
+    branch that returns something else — or raises — turns a correct
+    stand-down into a tight relaunch loop fighting the winner for the
+    screen. That is the failure `single_instance.py` was written to
+    prevent, and Phase 4 adds three new ways to reach it: a classifier, a
+    window-server query and a signal, all on the launch path.
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self._home = patch("pathlib.Path.home", return_value=Path(self._tmp.name))
+        self._home.start()
+        self.addCleanup(self._home.stop)
+        self._note = patch.object(menubar.diagnostics, "note")
+        self.note = self._note.start()
+        self.addCleanup(self._note.stop)
+        self._redirect = patch.object(
+            menubar.diagnostics, "redirect_stderr_to_log", return_value=None
+        )
+        self._redirect.start()
+        self.addCleanup(self._redirect.stop)
+
+    def run_main(self, outcome, show_extra=None, **extra):
+        calls = {}
+
+        def fake_arm(role, **rotation):
+            calls["arm"] = rotation
+            return None
+
+        with patch.object(
+            menubar.single_instance, "acquire", return_value=outcome
+        ), patch.object(
+            menubar.diagnostics, "arm_stack_dumps", side_effect=fake_arm
+        ), patch.object(
+            menubar.AppKit, "NSApplication"
+        ), patch.object(
+            menubar.MenuBarController, "start", lambda self: None
+        ), patch.object(
+            menubar.contention, "observe", **extra
+        ) as report, patch.object(menubar.notice_window, "show", **(show_extra or {})) as show:
+            code = menubar.main()
+        calls["report"] = report
+        calls["show"] = show
+        calls["code"] = code
+        return calls
+
+    def contended(self):
+        return menubar.single_instance.Acquisition(
+            menubar.single_instance.Outcome.CONTENDED
+        )
+
+    def acquired(self):
+        return menubar.single_instance.Acquisition(
+            menubar.single_instance.Outcome.ACQUIRED, io.StringIO()
+        )
+
+    def unguarded(self):
+        return menubar.single_instance.Acquisition(
+            menubar.single_instance.Outcome.UNGUARDED, io.StringIO()
+        )
+
+    def test_a_contended_launch_exits_zero(self) -> None:
+        self.assertEqual(self.run_main(self.contended())["code"], 0)
+
+    def test_a_contended_launch_reports_before_exiting(self) -> None:
+        calls = self.run_main(self.contended())
+        calls["report"].assert_called_once()
+
+    def test_every_branch_returns_zero(self) -> None:
+        """The class docstring says "0 in every branch"; only the
+        contended one asserted it, and `run_main` already returns the
+        code for free. A docstring that claims more than the assertions
+        is the same shape as Phase 3's `ordered_out` finding."""
+        for label, outcome in (
+            ("contended", self.contended()),
+            ("unguarded", self.unguarded()),
+            ("acquired", self.acquired()),
+        ):
+            with self.subTest(label):
+                self.assertEqual(self.run_main(outcome)["code"], 0)
+
+    def test_a_contended_launch_never_arms_and_so_never_rotates(self) -> None:
+        """The loser must not touch the winner's dump file at all."""
+        self.assertNotIn("arm", self.run_main(self.contended()))
+
+    def test_a_report_that_raises_still_exits_zero(self) -> None:
+        """`contention.report` is documented never to raise. Pinned
+        anyway: a diagnostic that becomes the fault is the exact shape of
+        this whole plan, and the cost of being wrong here is a respawn
+        loop rather than a missing log line.
+
+        And it is NOT redundant with `report`'s own guard: the arguments
+        are evaluated in `main()`, and three of them reach `Path.home()`,
+        which raises `RuntimeError` when a home directory cannot be
+        resolved. This test failed before that wrapper existed."""
+        with contextlib.redirect_stderr(io.StringIO()) as buf:
+            calls = self.run_main(self.contended(), side_effect=RuntimeError("boom"))
+        self.assertEqual(calls["code"], 0)
+        self.assertIn("exiting 0 anyway", buf.getvalue())
+
+    def test_an_unguarded_launch_arms_without_rotating(self) -> None:
+        self.assertEqual(self.run_main(self.unguarded())["arm"], {"sole_writer": False})
+
+    def test_an_unguarded_launch_says_so_in_the_log(self) -> None:
+        """The whole reason `acquire()` grew a third outcome: this line
+        could not be written before, because `main()` could not tell."""
+        self.run_main(self.unguarded())
+        said = "\n".join(str(call.args[0]) for call in self.note.call_args_list)
+        self.assertIn("WITHOUT the single-instance guard", said)
+
+    def test_a_guarded_launch_rotates(self) -> None:
+        self.assertEqual(self.run_main(self.acquired())["arm"], {"sole_writer": True})
+
+    def test_a_guarded_launch_never_reports_on_a_holder(self) -> None:
+        """There is no holder. Asking would read `ui.lock`, look up a
+        pid and probe the window server for nothing."""
+        self.run_main(self.acquired())["report"].assert_not_called()
+
+    # -- Phase 4b: the verdict reaches a screen, not only a log --------
+
+    @staticmethod
+    def a_report(notice=True):
+        """A `contention.Report`, reached through `menubar` so that this
+        file's import block — and therefore every line number the
+        exceptions file keys on — stays where it was."""
+        cstate = menubar.contention.cstate
+        found = (
+            cstate.Notice(
+                verdict=cstate.Verdict.UNRESPONSIVE,
+                headline="ImageView is not responding",
+                body="ImageView (pid 4321) is not responding.",
+                holder_pid=4321,
+            )
+            if notice
+            else None
+        )
+        icon = cstate.WindowFact(layer=25, on_screen=True, x=8.0, y=0.0, width=34.0, height=24.0)
+        return menubar.contention.Report(notice=found, icons=(icon,), avoid=())
+
+    def test_a_contended_launch_puts_the_notice_on_screen(self) -> None:
+        """The whole of Phase 4b's wiring. Until this existed the verdict
+        reached `ui.stderr.log` and nothing else — which is the exact
+        shape of the 2026-09-08 incident, where the app had a diagnosis
+        and no way to say it."""
+        found = self.a_report()
+        calls = self.run_main(self.contended(), return_value=found)
+        calls["show"].assert_called_once_with(found.notice, found.icons, found.avoid)
+
+    def test_an_agent_respawn_puts_nothing_on_screen(self) -> None:
+        """`observe()` returns a Report with no notice for a LaunchAgent
+        respawn. A window at every login would be the noise this whole
+        phase is trying not to become."""
+        calls = self.run_main(self.contended(), return_value=self.a_report(notice=False))
+        calls["show"].assert_not_called()
+        self.assertEqual(calls["code"], 0)
+
+    def test_a_notice_window_that_raises_still_exits_zero(self) -> None:
+        """`notice_window.show` is documented never to raise. Pinned
+        anyway, for the same reason the report wrapper is: this is the
+        newest code on the launch path, and the cost of being wrong is a
+        respawn loop rather than a missing window."""
+        with contextlib.redirect_stderr(io.StringIO()) as buf:
+            calls = self.run_main(
+                self.contended(),
+                show_extra={"side_effect": RuntimeError("boom")},
+                return_value=self.a_report(),
+            )
+        self.assertEqual(calls["code"], 0)
+        self.assertIn("exiting 0 anyway", buf.getvalue())
 
 
 if __name__ == "__main__":

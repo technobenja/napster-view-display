@@ -1313,20 +1313,34 @@ def main() -> None:
     print("view-lab app.py starting.", file=sys.stderr)
 
     # single-instance guard, before any window or timer exists.
-    # Returning None means another display process already holds the
-    # lock; exit(0) — CLEANLY — because KeepAlive{SuccessfulExit: false}
-    # does not respawn a clean exit, so the loser stays down instead of
+    # CONTENDED means another display process already holds the lock;
+    # exit(0) — CLEANLY — because KeepAlive{SuccessfulExit: false} does
+    # not respawn a clean exit, so the loser stays down instead of
     # respawn-looping against the winner.
-    if single_instance.acquire(paths.lock_path()) is None:
+    guard = single_instance.acquire(paths.lock_path())
+    if guard.contended:
         print("view-lab app.py exiting cleanly (another instance is running).", file=sys.stderr)
         sys.exit(0)
+    if guard.unguarded:
+        # Deliberately not fatal — see single_instance.acquire(). Said
+        # plainly here because until acquire() reported three outcomes
+        # this state was indistinguishable from a clean start, and the
+        # next line depends on knowing the difference.
+        print(
+            "view-lab app.py: running WITHOUT the single-instance guard "
+            "(the lock file could not be created). A second display agent "
+            "is not excluded, and display.stacks.log will not be rotated.",
+            file=sys.stderr,
+        )
 
     # `kill -USR1 <pid>` now dumps every thread's Python stack to
     # <role>.stacks.log. Armed here and not earlier because arming
-    # rotates that file, and only an instance for which `acquire()`
-    # returned a handle is entitled to; see the rotation rule in
-    # diagnostics.py, which also names what that does not cover — the
-    # `_no_guard()` sentinel is a handle without a lock.
+    # rotates that file, and only an instance that actually holds the
+    # lock is entitled to; see the rotation rule in diagnostics.py.
+    # `sole_writer=guard.acquired` is what closes the hole that rule used
+    # to name and could not prevent: under the `_no_guard()` sentinel
+    # this process holds no lock, so it arms without rotating rather than
+    # zeroing a running instance's accumulated dumps.
     #
     # This agent already has a log, so unlike the menu bar it does not
     # redirect stderr — launchd's StandardErrorPath owns it, and running
@@ -1336,7 +1350,9 @@ def main() -> None:
     # run the same AppKit run loop, and a run loop that stops servicing
     # timers is exactly the state no Python-level handler can report —
     # the same fact SIGNAL_RESPONSIVENESS_INTERVAL_S exists for.
-    stacks_log = diagnostics.arm_stack_dumps(paths.DISPLAY_ROLE)
+    stacks_log = diagnostics.arm_stack_dumps(
+        paths.DISPLAY_ROLE, sole_writer=guard.acquired
+    )
     if stacks_log is not None:
         print(
             f"  stack dumps: kill -USR1 {os.getpid()} -> {stacks_log}",

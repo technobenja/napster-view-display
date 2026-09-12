@@ -118,6 +118,9 @@ class SettingsController(AppKit.NSObject):
         self._test_result = None
         self._testing = False
         self._test_token = 0
+        #: The folder picker while its sheet is up, else `None`.
+        #: `chooseFolder_` explains what depends on it.
+        self._panel = None
         self._dirty = False
         return self
 
@@ -839,18 +842,111 @@ class SettingsController(AppKit.NSObject):
             print(f"poolChanged_:\n{traceback.format_exc()}", file=sys.stderr)
 
     def chooseFolder_(self, sender) -> None:
+        """Open the folder picker as a **sheet** on this window.
+
+        `beginSheetModalForWindow:completionHandler:`, never
+        `runModal()`. A modal run loop spins in
+        `NSModalPanelRunLoopMode`, where the default-mode timer that
+        stamps `ui_heartbeat_at` stops firing entirely — measured on
+        macOS 26.6.2 at **51.2 seconds frozen** around an About box —
+        which was an `NSAlert` when that was measured and is a non-modal
+        panel from v1.1.6, though the three alerts still in *this* file
+        freeze the stamp exactly the same way — and
+        a folder browse is held open far longer than that. It is also the
+        app's primary setup flow, and on macOS 26 a panel can open
+        *behind* everything (DevForums 807805), which reads to the user
+        as an app that did not respond. A sheet is attached to its
+        window, so it cannot be lost behind one, and it runs on the
+        ordinary run loop, so the heartbeat keeps beating through a
+        browse of any length.
+
+        **The whole risk of this conversion is that this call now
+        returns immediately.** Everything that used to run inline after
+        `runModal()` lives in `_folder_chosen`.
+        """
         try:
+            window = self._window
+            if window is None:
+                return
             panel = AppKit.NSOpenPanel.openPanel()
             panel.setCanChooseFiles_(False)
             panel.setCanChooseDirectories_(True)
             panel.setAllowsMultipleSelection_(False)
             panel.setPrompt_("Choose")
-            if panel.runModal() != AppKit.NSModalResponseOK:
-                return
+            # Held on the controller for the sheet's lifetime, for two
+            # reasons. It is what `_install_key_monitor` tests to keep Esc
+            # from tearing this window down out from under a live sheet —
+            # `isKeyWindow()` alone is an inference about which window
+            # AppKit considers key while a sheet is up, and this does not
+            # depend on it being right. And a local `NSOpenPanel` with an
+            # asynchronous completion handler is the classic pyobjc
+            # premature-release shape.
+            self._panel = panel
+            try:
+                panel.beginSheetModalForWindow_completionHandler_(
+                    window, lambda response: self._folder_chosen(panel, response)
+                )
+            except Exception:
+                # `_folder_chosen` is the only other place that clears
+                # `_panel`, and it never runs if this raises. Leaving the
+                # reference set would disable Esc on this window for the
+                # rest of its life, silently, with a traceback on a
+                # stderr nobody reads. The assignment stays *before* the
+                # call: if AppKit ever invoked the handler inline,
+                # assigning after would clobber the handler's own clear.
+                self._panel = None
+                raise
+        except Exception:
+            print(f"chooseFolder_:\n{traceback.format_exc()}", file=sys.stderr)
+
+    @objc.python_method
+    def _folder_chosen(self, panel, response) -> None:
+        """The second half of `chooseFolder_`, run when the sheet closes.
+
+        Its own `try/except`, deliberately: this runs as an AppKit
+        callback long after `chooseFolder_` returned, so that method's
+        handler cannot catch anything raised here — it would unwind into
+        the Objective-C runtime instead.
+        """
+        try:
+            # Both before anything else, and before any early return.
+            # Whether AppKit has already ordered the sheet out by the time
+            # it calls this is a detail I could not verify from here, and
+            # `orderOut_` on a panel that is already gone is a no-op — so
+            # do it and stop depending on the answer. It matters because
+            # the work below ends in a Test whose folder read is what
+            # raises the TCC prompt, and a system prompt stacked on a live
+            # sheet is a worse thing to hand a user than one extra call.
+            panel.orderOut_(None)
+            if self._panel is panel:
+                self._panel = None
             url = panel.URL()
-            if url is None:
+            folder = ss.sheet_folder_choice(
+                response=int(response),
+                # `str(url.path())` exactly as the inline version had it,
+                # including its behaviour when a URL carries no path.
+                path=None if url is None else str(url.path()),
+                # 🔵 **CORRECTED. This comment said the two halves were
+                # redundant by construction and told the next reader not
+                # to test them — and named their reachability in its own
+                # previous sentence.** `_finish` sets `_closing = True`,
+                # then calls `removeMonitor_` and `orderOut_`, **either
+                # of which can raise**, and only then sets
+                # `_window = None`; `_finish` has no `try` of its own. So
+                # `_closing=True, _window is not None` is precisely the
+                # state a raise in teardown leaves behind, and it is the
+                # state a live sheet's completion handler is then
+                # dispatched into.
+                #
+                # Both halves were mutation survivors because every test
+                # reached this state through `_finish`, which sets both.
+                # `ui/test_folder_sheet.TornDownWindowTests` now drives
+                # each on its own and both mutations are killed.
+                still_editing=not self._closing and self._window is not None,
+            )
+            if folder is None:
                 return
-            self._form.folder = str(url.path())
+            self._form.folder = folder
             self._invalidate_test()
             self._sync()
             # Test immediately. The panel is also what triggers the TCC
@@ -858,7 +954,7 @@ class SettingsController(AppKit.NSObject):
             # and the moment the answer is most useful.
             self.testSource_(None)
         except Exception:
-            print(f"chooseFolder_:\n{traceback.format_exc()}", file=sys.stderr)
+            print(f"_folder_chosen:\n{traceback.format_exc()}", file=sys.stderr)
 
     def testSource_(self, sender) -> None:
         """Test button.
@@ -1189,6 +1285,16 @@ class SettingsController(AppKit.NSObject):
             try:
                 if (
                     self._window is not None
+                    # A live folder sheet owns Esc. Without this, an Esc
+                    # that reached here would run `_finish`, order the
+                    # window out and drop it — leaving a sheet attached
+                    # to a window that no longer exists, which is a hang
+                    # shape, in the phase whose whole purpose is to
+                    # remove one. The `isKeyWindow()` test below is
+                    # *expected* to be False while a sheet is up, but
+                    # that is an inference about AppKit's key window and
+                    # this does not rest on it.
+                    and self._panel is None
                     and self._window.isKeyWindow()
                     and event.keyCode() == KEY_CODE_ESCAPE
                 ):

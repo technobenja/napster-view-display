@@ -738,7 +738,7 @@ class SingleInstanceStartupTests(unittest.TestCase):
         respawn-looping."""
         with patch.object(app.paths, "ensure_all"), patch.object(
             app, "rotate_if_oversized"
-        ), patch.object(app.single_instance, "acquire", return_value=None), patch.object(
+        ), patch.object(app.single_instance, "acquire", return_value=_lost()), patch.object(
             app, "load_calibration_resolved"
         ) as mock_load_calibration:
             with self.assertRaises(SystemExit) as caught:
@@ -750,7 +750,7 @@ class SingleInstanceStartupTests(unittest.TestCase):
     def test_main_locks_the_documented_path(self) -> None:
         with patch.object(app.paths, "ensure_all"), patch.object(
             app, "rotate_if_oversized"
-        ), patch.object(app.single_instance, "acquire", return_value=None) as mock_acquire:
+        ), patch.object(app.single_instance, "acquire", return_value=_lost()) as mock_acquire:
             with self.assertRaises(SystemExit):
                 app.main()
         mock_acquire.assert_called_once_with(app.paths.lock_path())
@@ -789,7 +789,7 @@ class StackDumpArmingTests(unittest.TestCase):
     process anyone wants to diagnose would land in `.old`.
     """
 
-    def _run_main(self, acquired: object) -> list[str]:
+    def _run_main(self, outcome: object) -> list[str]:
         """Run the real `main()` past the guard, recording the order of
         the two calls that matter. Everything with a side effect outside
         the process is mocked; `Path.home()` is never reached because
@@ -798,9 +798,9 @@ class StackDumpArmingTests(unittest.TestCase):
 
         def fake_acquire(*_args, **_kwargs):
             order.append("acquire")
-            return acquired
+            return outcome
 
-        def fake_arm(role):
+        def fake_arm(role, **rotation):
             order.append(f"arm:{role}")
             return None
 
@@ -825,7 +825,7 @@ class StackDumpArmingTests(unittest.TestCase):
         ), patch.object(
             app.AppKit, "NSTimer"
         ):
-            if acquired is None:
+            if outcome.contended:
                 with self.assertRaises(SystemExit) as caught:
                     app.main()
                 self.assertEqual(caught.exception.code, 0)
@@ -835,13 +835,13 @@ class StackDumpArmingTests(unittest.TestCase):
 
     def test_main_arms_stack_dumps_after_taking_the_lock(self) -> None:
         self.assertEqual(
-            self._run_main(Mock(name="lock_handle")),
+            self._run_main(_won()),
             ["acquire", f"arm:{app.paths.DISPLAY_ROLE}"],
         )
 
     def test_a_losing_instance_never_arms_and_so_never_rotates(self) -> None:
         """The loser must not touch the winner's dump file at all."""
-        self.assertEqual(self._run_main(None), ["acquire"])
+        self.assertEqual(self._run_main(_lost()), ["acquire"])
 
 
 class SignalHeartbeatTests(unittest.TestCase):
@@ -875,7 +875,7 @@ class SignalHeartbeatTests(unittest.TestCase):
         with patch.object(app.paths, "ensure_all"), patch.object(
             app, "rotate_if_oversized"
         ), patch.object(
-            app.single_instance, "acquire", return_value=Mock()
+            app.single_instance, "acquire", return_value=_won()
         ), patch.object(
             app, "load_calibration_resolved", return_value=resolved_calibration
         ), patch.object(
@@ -1614,6 +1614,94 @@ class StatusFieldTests(unittest.TestCase):
 
         app.merge_status(last_error=app.CLEAR)
         self.assertIsNone(self._status()["last_error"])
+
+
+def _won() -> app.single_instance.Acquisition:
+    """`acquire()` succeeded. Appended at the end of this file rather
+    than defined near its callers on purpose: `docs/release/
+    grep-exceptions.txt` keys accepted SOFT-term occurrences by line
+    number all the way to the bottom of this module, so anything inserted
+    above shifts them and reds the suite for a reason unrelated to the
+    change."""
+    return app.single_instance.Acquisition(
+        app.single_instance.Outcome.ACQUIRED, Mock(name="lock_handle")
+    )
+
+
+def _lost() -> app.single_instance.Acquisition:
+    """`acquire()` found another instance holding the lock."""
+    return app.single_instance.Acquisition(app.single_instance.Outcome.CONTENDED)
+
+
+def _unguarded() -> app.single_instance.Acquisition:
+    """`acquire()` could not create the lock file at all."""
+    return app.single_instance.Acquisition(
+        app.single_instance.Outcome.UNGUARDED, Mock(name="devnull")
+    )
+
+
+class UnguardedStartupTests(unittest.TestCase):
+    """The third outcome, which used to be indistinguishable from the
+    first.
+
+    Arming `faulthandler` rotates `<role>.stacks.log` in place, and an
+    instance that holds no lock has not proven it is the sole writer — so
+    a second unguarded instance would zero a running instance's
+    accumulated dumps. `diagnostics.py` recorded that as an accepted gap
+    because telling the two states apart "needs a wider return type than
+    this phase is entitled to change". The return type is wider now.
+    """
+
+    def _arm_kwargs(self, outcome: object) -> dict:
+        seen: dict = {}
+
+        def fake_arm(role, **rotation):
+            seen.update(rotation)
+            return None
+
+        with patch.object(app.paths, "ensure_all"), patch.object(
+            app, "rotate_if_oversized"
+        ), patch.object(
+            app.single_instance, "acquire", return_value=outcome
+        ), patch.object(
+            app.diagnostics, "arm_stack_dumps", side_effect=fake_arm
+        ), patch.object(
+            app, "load_calibration_resolved", return_value=_resolved_calibration()
+        ), patch.object(
+            app, "load_settings_resolved", return_value=_resolved_settings()
+        ), patch.object(
+            app, "merge_status"
+        ), patch.object(
+            app, "install_signal_handlers"
+        ), patch.object(
+            app, "Bootstrapper"
+        ), patch.object(
+            app.AppKit, "NSApplication"
+        ), patch.object(
+            app.AppKit, "NSTimer"
+        ):
+            app.main()
+        return seen
+
+    def test_an_unguarded_instance_arms_but_does_not_rotate(self) -> None:
+        self.assertEqual(self._arm_kwargs(_unguarded()), {"sole_writer": False})
+
+    def test_a_guarded_instance_rotates(self) -> None:
+        self.assertEqual(self._arm_kwargs(_won()), {"sole_writer": True})
+
+    def test_an_unguarded_instance_still_starts(self) -> None:
+        """Behaviour preserved exactly: refusing to start because a *lock
+        file* could not be created still inverts this project's failure
+        philosophy. Only the visibility of the state is new."""
+        # Imported here, not at the top of the module: see `_won()` for
+        # why nothing may be inserted above line 1480 of this file.
+        import io
+        from contextlib import redirect_stderr
+
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            self._arm_kwargs(_unguarded())
+        self.assertIn("WITHOUT the single-instance guard", buf.getvalue())
 
 
 if __name__ == "__main__":

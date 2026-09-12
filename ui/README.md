@@ -56,19 +56,61 @@ cleanly, and you keep the single status item you already had.
 Without this you would get two identical icons in the menu bar with no
 way to tell them apart, and two processes writing `command.json`.
 
-**Known rough edge:** launching ImageView while it is already running
-does nothing visible. No bounce, no window, no message — the status item
-is simply already there. The right fix is for the second instance to
-flash or highlight the existing status item before exiting, which needs a
-channel between the two UI processes that does not exist yet. Being told
-"already running" in an alert would be worse: it is noise attached to a
-non-problem.
+🔵 **Corrected twice, and this is the current behaviour.** This section
+used to say that launching an already-running ImageView "does nothing
+visible", and that fixing it "needs a channel between the two UI
+processes that does not exist yet". Neither is true any more.
 
-It is no longer *silent*, though: the second instance writes the reason —
-which lock, which pid holds it, and that exiting 0 was deliberate — to
-`ui.stderr.log` before it goes. That matters when the status item is
-**not** already there, because then the holder is stuck rather than
-healthy, and "the app will not launch" is the only symptom you get.
+There is no channel and none was needed: the arriving instance asks the
+window server directly where the holder's status item is, and whether it
+has one at all — no cooperation from the holder, and no permission
+prompt.
+
+**Launching an already-running ImageView now shows you a small window**,
+placed directly underneath the running copy's menu bar icon, so you can
+see which icon it means without being told a screen coordinate. It says
+which of the situations below it found. The only one that closes itself
+is "already running, and here is your icon", after eight seconds;
+everything else carries an instruction and stays until you close it.
+
+It never becomes the front window, it never takes your keyboard focus,
+and it never asks you to confirm anything. **It is not an alert** — an
+alert would be noise attached to a non-problem, and a modal alert is the
+mechanism suspected in the fault this whole thing exists to explain.
+
+A LaunchAgent respawn that loses the lock shows nothing at all. That is
+routine housekeeping and you should not hear about it.
+
+The same verdict also goes to `ui.stderr.log`, so it outlives the window:
+
+| what it found | what it says |
+|---|---|
+| running, icon visible | already running — its icon is at these coordinates, click it |
+| running, icon hidden | already running, but its only icon is hidden or is on the picture display — make room in the menu bar |
+| **running, but it has never reported** | **almost certainly a copy older than v1.1.5, which never wrote a heartbeat at all — click the icon; if the menu opens, nothing is wrong** |
+| running, cannot write `state/` | it cannot write `~/.viewlab/state/`, so it cannot say whether it is working; it may be perfectly healthy, and it recovers on its own |
+| stopped, a window on screen | a window is open, possibly behind another one — look at your screen |
+| stopped, nothing to explain it | not responding; **this pid**, and the other ImageView is the one drawing your pictures |
+| the lock is held by something else | the pid is absent, foreign, or disagrees with the heartbeat file — reported, nothing assumed, nothing signalled |
+
+The third row is the one most people will ever see, because it is what a
+contended launch produces the first time you run a new copy while an old
+one is still going. It is not a fault.
+
+All of it matters most when the status item is **not** already there,
+because then the holder is stuck rather than healthy and "the app will
+not launch" is the only symptom you get.
+
+It never acts on any of that. It does not quit, kill, or take over the
+holder — an ordinary modal dialog freezes the heartbeat exactly the way a
+wedge does, so "the stamp is stale" includes a perfectly healthy app that
+is simply showing you something and waiting.
+
+The measurement behind that sentence is an About box that froze the stamp
+for **51 seconds**, on 2026-09-10. From v1.1.6 the About box is no longer
+a modal, so **that particular reproduction no longer works** — the reading
+is still right, and the windows that still do it are named under
+*Telling a wedged menu bar from a healthy one* below.
 
 The display agent has its own separate lock (`~/.viewlab/display.lock`).
 The two never contend.
@@ -110,22 +152,62 @@ last beat. Neither form can raise on a machine that has no such file.
 The display agent has carried the same stamp, as `heartbeat_at` in
 `status.json`, since it was first written — this is the other half of it.
 
+**From v1.1.6 the file carries four more fields**, written by that same
+timer in the same atomic write, so they always describe the same instant
+as the stamp:
+
+| field | what it is for |
+|---|---|
+| `pid` | which process was serving. A *stale* file then names the process that stopped, which is the thing a diagnosis starts from |
+| `exe` | its executable path, so a recycled pid cannot be mistaken for a live menu bar |
+| `stacks_armed` | whether `kill -USR1` on that pid is a stack dump or a **kill** — see below |
+| `stacks_path` | where the dump would land |
+
+Older readers ignore fields they do not know, and this reader treats all
+four as optional: a v1.1.5 file carrying only the stamp still reads
+correctly. The timer remains the **only** writer, which is what keeps the
+file's existence meaningful — it exists because something serviced a
+timer, not because something intended to.
+
 Three things this does **not** mean:
 
 - **A missing file is not by itself a wedge.** Older builds never wrote
   one, and a menu bar that has not yet reached its run loop has not
   written one yet either. Check that the process exists at all first
   (`pgrep -fl ImageView`).
-- **A stale stamp while a menu, the About box, a settings window or a
-  file picker is on screen is EXPECTED — not a fault.** The stamp is
-  written from a timer registered in the default run-loop mode, and
-  measurement says such a timer fires **zero** times while the run loop
-  is tracking a menu or running a modal panel. That is deliberate: it is
-  exactly what lets a stale stamp catch a modal that has wedged. The cost
-  is that it cannot distinguish that from a modal a user opened on
-  purpose. **Look at the screen before concluding anything**, and never
-  kill the process on this signal alone — browsing for a picture folder
-  for thirty seconds looks identical to a thirty-second hang.
+- **A stale stamp while a menu or certain windows are on screen is
+  EXPECTED — not a fault.** The stamp is written from a timer registered
+  in the default run-loop mode, and measurement says such a timer fires
+  **zero** times while the run loop is tracking a menu or running a modal
+  panel. That is deliberate: it is exactly what lets a stale stamp catch
+  a modal that has wedged. The cost is that it cannot distinguish that
+  from a modal somebody opened on purpose. **Look at the screen before
+  concluding anything**, and never kill the process on this signal alone.
+
+  **From v1.1.6 onward, only some of this app's windows still do it.**
+  The list shrank twice and is worth checking against your version rather
+  than assuming:
+
+  | on screen | freezes the stamp? |
+  |---|---|
+  | an open menu | **yes** — menus track in their own run-loop mode |
+  | Settings' three alerts, and two of *Adjust the circle*'s | **yes** — still modal, deliberately |
+  | *Adjust the circle*'s Save / Discard / Cancel question | **yes** — it has to block, something depends on the answer |
+  | the About box | **no, from v1.1.6** — it was the 51-second measurement |
+  | *Couldn't start showing pictures* | **no, from v1.1.6** |
+  | *The View isn't connected* | **no, from v1.1.6** |
+  | first run's *Couldn't save your settings* and *That source isn't complete* | **no, from v1.1.6** — sheets |
+  | the folder picker | **no, from v1.1.6** — a sheet |
+  | a settings window merely being open | **no, on any build** |
+
+  **On builds before v1.1.6 every row above is yes except the last**, and
+  the picker in particular is held open for as long as someone browses,
+  so a thirty-second browse looked identical to a thirty-second hang.
+
+  The rows that changed in v1.1.6 are the ones that could be reached with
+  **no window of this app on screen to open in front of**. That is the
+  shape that produced 2026-09-08, and one fewer benign cause of a stale
+  stamp is one fewer way to read a healthy app as a broken one.
 - **A stale stamp is not proof of a hang** for a second reason: if
   `~/.viewlab/state/` has become unwritable, a perfectly healthy menu bar
   goes stale. It says so in `ui.stderr.log` when that happens.
@@ -214,7 +296,7 @@ Two things it does that the manual recipe cannot:
   inside the installed app until this script existed. The only reliable
   filter is what is on disk when py2app runs.
 
-The seven gates fail the build rather than warn — a leaking or broken
+The eight gates fail the build rather than warn — a leaking or broken
 build produces no `.dmg`:
 
 | Gate | Passing means |
@@ -313,12 +395,53 @@ no handler installed, `SIGUSR1`'s default action is to **terminate the
 process** — so on an older build this kills the very thing you were
 being careful not to lose.
 
+🔴 **`stacks_armed` is only true of the pid the same file names.** Read
+both, and signal *that* pid — never one found some other way:
+
 ```sh
-grep 'kill -USR1' ~/Library/Logs/ImageView/ui.stderr.log
+PID=$(plutil -extract pid raw ~/.viewlab/state/ui_status.json) || exit
+ARMED=$(plutil -extract stacks_armed raw ~/.viewlab/state/ui_status.json) || exit
+LIVE=$(pgrep -f 'ImageView$')
+
+[ "$ARMED" = true ] || { echo "stack dumps are NOT armed - do not signal"; exit; }
+[ "$PID" = "$LIVE" ] || { echo "the file names pid $PID, but pid $LIVE is running - STOP"; exit; }
+
+kill -USR1 "$PID"
+plutil -extract stacks_path raw ~/.viewlab/state/ui_status.json
 ```
 
-If that names a pid and a path, dumps are armed. If it prints nothing,
-**stop** — do not send the signal.
+If any of that exits early, **stop** and do not send the signal.
+
+**Why the pid comparison is the load-bearing half, not a nicety.** An
+earlier version of this section read `stacks_armed` and then signalled a
+pid from `pgrep`, on the reasoning that the file "describes the process
+running now, or it is stale, and either way it cannot describe a
+different one". That is wrong, and the case is ordinary rather than
+exotic: nothing deletes this file when a process exits. Suppose v1.1.6
+writes `stacks_armed: true, pid: 100` and then crashes, and you drag the
+older bundle back — which is how this app downgrades, and the reason the
+"has never reported" message below exists at all. The old build starts as
+pid 200 and writes nothing. The file still says `true`. Signalling pid
+200 **terminates it**, at the exact moment you were being careful not to
+lose it.
+
+`plutil` rather than `python3` or `jq` deliberately: it is part of macOS
+and is present on a machine that has never had Xcode or Homebrew on it.
+A troubleshooting instruction that needs a toolchain installed first is
+not one a stranger can follow at the moment they need it.
+
+🔵 This also replaces an instruction to
+`grep 'kill -USR1' ~/Library/Logs/ImageView/ui.stderr.log`. That log is
+append-only across every launch, so a line written by a healthy launch
+last week survives a launch today that failed before arming — and the
+build you are about to signal is, by definition, the one behaving
+strangely.
+
+The app makes the same two checks before it signals anything, and two
+more the shell cannot easily make: it requires the pid in this file to
+equal the pid in `ui.lock`, and it re-reads the holder's start time
+immediately before signalling, so a pid recycled while it was thinking
+cannot be mistaken for the process it looked at.
 
 ```sh
 kill -USR1 $(pgrep -f 'ImageView$')

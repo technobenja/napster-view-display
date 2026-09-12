@@ -142,13 +142,18 @@ class BundleSafetyTests(unittest.TestCase):
         self.assertTrue(paths.bundled_calibration_path().is_file())
         self.assertTrue(paths.bundled_settings_path().is_file())
 
-    def test_bundle_id_is_not_com_remy(self) -> None:
-        """This is ruled out explicitly, and `com\\.remy\\.` is added to the
-        HARD leak-scan grep: the shipped identifier lands in every stranger's
-        ~/Library/LaunchAgents, launchctl list, Info.plist, and code
-        signature."""
-        self.assertNotIn("com.remy", paths.BUNDLE_ID)
-        self.assertNotIn("remy", paths.BUNDLE_ID.lower())
+    def test_bundle_id_is_the_settled_project_scoped_value(self) -> None:
+        """The shipped identifier lands in every stranger's
+        ~/Library/LaunchAgents, `launchctl list`, Info.plist and code
+        signature, so it must carry no author identity.
+
+        🔴 **Asserted as the positive value, never as "not <handle>".**
+        A test that rules a personal handle out by naming it publishes
+        that handle — in this repository, which is the exact disclosure
+        the test exists to prevent. Equality with the settled constant
+        is also the stronger claim: it excludes every handle at once,
+        including ones nobody thought to list."""
+        self.assertEqual(paths.BUNDLE_ID, "dev.viewlab.imageview")
 
 
 class NoBundleRelativeWritablePathsTest(unittest.TestCase):
@@ -275,10 +280,14 @@ class AgentLabelTests(unittest.TestCase):
         self.assertNotEqual(paths.UI_AGENT_LABEL, paths.DISPLAY_AGENT_LABEL)
 
     def test_shipped_labels_carry_no_personal_identity(self) -> None:
-        """`com\\.remy\\.` is on the HARD grep list; these land in
-        every user's ~/Library/LaunchAgents/."""
+        """These land in every user's ~/Library/LaunchAgents/.
+
+        Stated as a property — project-scoped under the settled bundle
+        id — rather than by naming a handle to exclude. Naming one here
+        would publish it; deriving from `BUNDLE_ID` excludes all of
+        them, and stays true if the id is ever changed again."""
         for label in (paths.UI_AGENT_LABEL, paths.DISPLAY_AGENT_LABEL):
-            self.assertNotIn("remy", label.lower())
+            self.assertTrue(label.startswith(f"{paths.BUNDLE_ID}."))
             self.assertFalse(label.startswith("com."))
 
     def test_the_shipped_display_label_is_project_scoped(self) -> None:

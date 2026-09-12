@@ -59,8 +59,10 @@ import objc
 
 from display import control, diagnostics, paths, single_instance
 from display.config_store import read_json_object
+from ui import contention
 from ui import first_run_state as fr
 from ui import menubar_state as ms
+from ui import notice_window
 from ui import ui_agent
 
 #: How often the UI re-reads `status.json`. Fast enough that the
@@ -95,6 +97,23 @@ POLL_INTERVAL_S = 0.4
 #: a removal step. Switching it is a live behaviour change on the
 #: development machine, so it is an owner decision, not a sweep.
 DISPLAY_AGENT_LABEL = paths.DISPLAY_AGENT_LABEL
+
+#: The two things this menu bar has to say in a window, one slot each.
+#:
+#: Two slots rather than one because either may be on screen while the
+#: other is; and slots at all because a second click on the *same* menu
+#: item must re-show the panel already up rather than stack an identical
+#: one behind it. That could not happen while these were `runModal()` —
+#: a modal blocked the menu — and it is the one thing the conversion
+#: gives away. Two clicks on *Start showing pictures* also cost two
+#: 5-second main-thread `launchctl` waits; that is unchanged by this
+#: phase and `_launchctl` documents it.
+#:
+#: Namespaced, because `notice_window._SLOTS` is module-level and shared
+#: with every other advisory site — a bare "about" is one careless
+#: collision away from two unrelated windows evicting each other.
+ADVISORY_ABOUT = "menubar.about"
+ADVISORY_START_FAILED = "menubar.start_failed"
 
 
 def agent_plist_path() -> Path:
@@ -132,6 +151,13 @@ class MenuBarController(AppKit.NSObject):
         # Whether the last heartbeat write failed, so that only the
         # transitions are logged. See `_write_ui_heartbeat`.
         self._ui_heartbeat_failing = False
+        # This process's executable path as the kernel records it, read
+        # once rather than on every heartbeat: it cannot change for the
+        # life of the process, and `proc_pidpath` is a syscall that would
+        # otherwise run every 2 seconds forever. It is published in
+        # `ui_status.json` so that a later arriving instance can say what
+        # the holder *is*, not only that it exists.
+        self._own_exe = contention.own_exe()
         # The open calibration window, or None. Held here rather
         # than on the app object because the menu's enabled-state depends
         # on it, and because nothing else retains it — a
@@ -468,7 +494,21 @@ class MenuBarController(AppKit.NSObject):
         # a performance one. `write_ui_heartbeat` never raises; it returns
         # False, and the resulting staleness is itself the report.
         self._last_ui_heartbeat_at = now
-        failing = not ms.write_ui_heartbeat(paths.ui_status_path(), now)
+        # The four process fields ride the same atomic write as the
+        # stamp, so a reader can never catch a fresh timestamp against a
+        # previous process's pid. `armed_stacks_path()` is read on every
+        # write rather than captured once because arming happens in
+        # `main()`, after this object exists, and a value cached at
+        # `init` would be permanently None.
+        stacks = diagnostics.armed_stacks_path()
+        failing = not ms.write_ui_heartbeat(
+            paths.ui_status_path(),
+            now,
+            pid=os.getpid(),
+            exe=self._own_exe,
+            stacks_armed=stacks is not None,
+            stacks_path=str(stacks) if stacks is not None else None,
+        )
         if failing != self._ui_heartbeat_failing:
             # Log the *transitions* only, never the state. A menu bar that
             # cannot write this file goes stale and therefore reads as
@@ -488,16 +528,34 @@ class MenuBarController(AppKit.NSObject):
             # interactions:
             #
             #   * an open menu (event tracking), for as long as it is read;
-            #   * the About box and `_alert()`, which are `runModal()`;
-            #   * Settings / First Run / Adjust the circle, which carry
-            #     `NSOpenPanel.runModal()` — the file picker in the app's
-            #     primary setup flow, held open far longer than 5s.
+            #   * the three alerts in Settings, and the three in Adjust
+            #     the circle, which are `runModal()`.
+            #
+            # 🔵 **The list has shrunk twice and this comment has been
+            # wrong after each shrink.** It once named the file picker in
+            # Settings and First Run; Phase 3 made both sheets, and a
+            # sheet spins no nested run loop. It then named "the About
+            # box and `_alert()`" — Phase 5 converted every modal in this
+            # file, both of First Run's, and the one in Adjust the circle
+            # that fires before its windows exist. None of those freezes
+            # this stamp any more.
             #
             # So a stale `ui_heartbeat_at` means "not servicing default-
-            # mode timers", which is a superset of "wedged". Nothing may
-            # act destructively on staleness alone: a Phase 4 that offered
-            # to SIGKILL on this signal would kill a user's open file
-            # picker mid-browse. A default-mode timer cannot tell modally
+            # mode timers", which is still a superset of "wedged".
+            # Nothing may act destructively on staleness alone: a Phase 4
+            # that offered to SIGKILL on this signal would kill a healthy
+            # app because somebody left a Settings alert on screen.
+            #
+            # ⚠️ **The measurement behind that conclusion has outlived
+            # its recipe, which is worth knowing before anyone tries to
+            # reproduce it.** M1 measured the About box freezing this
+            # stamp for **51.2 seconds** on macOS 26.6.2, 2026-09-10 —
+            # ten times the 5s threshold. It was true of a modal run
+            # loop, and modal run loops still exist; but the About box is
+            # no longer one, so re-running M1 through About now finds no
+            # freeze at all. Use a Settings alert instead. The conclusion
+            # is unchanged; only the way to see it again has moved.
+            # A default-mode timer cannot tell modally
             # wedged from modally busy on purpose; the corroborating
             # common-modes signal that can is recorded against Phase 3/4
             # in docs/plans/ui-wedge-remediation.md.
@@ -798,11 +856,13 @@ class MenuBarController(AppKit.NSObject):
             if not plist.exists():
                 if ui_agent.install_display():
                     return
-                self._alert(
+                self._advise(
+                    ADVISORY_START_FAILED,
                     "Couldn't start showing pictures.",
-                    "The display agent could not be installed. If ImageView "
-                    "is not in your Applications folder, move it there and "
-                    "try again.",
+                    "The part of ImageView that draws the pictures could not "
+                    "be installed. If ImageView is not in your Applications "
+                    "folder, move it there, open it again, and choose Start "
+                    "showing pictures.",
                 )
                 return
             if self._launchctl(["kickstart", "-k", label]):
@@ -810,10 +870,12 @@ class MenuBarController(AppKit.NSObject):
             if self._launchctl(["bootstrap", domain, str(plist)]):
                 self._launchctl(["kickstart", label])
                 return
-            self._alert(
+            self._advise(
+                ADVISORY_START_FAILED,
                 "Couldn't start showing pictures.",
-                "Login Items is blocking this — check System Settings → "
-                "General → Login Items.",
+                "Login Items is blocking this. Check System Settings → "
+                "General → Login Items, then choose Start showing pictures "
+                "again.",
             )
         except Exception:
             print(f"startDisplay_:\n{traceback.format_exc()}", file=sys.stderr)
@@ -909,18 +971,51 @@ class MenuBarController(AppKit.NSObject):
             "CFBundleShortVersionString"
         )
         title, body = ms.about_text(version)
-        self._alert(title, body)
+        self._advise(ADVISORY_ABOUT, title, body)
 
     @objc.python_method
-    def _alert(self, message: str, informative: str) -> None:
-        alert = AppKit.NSAlert.alloc().init()
-        alert.setMessageText_(message)
-        alert.setInformativeText_(informative)
-        alert.addButtonWithTitle_("OK")
-        # An accessory app has no windows, so the alert would otherwise
-        # open behind whatever the user is looking at.
-        AppKit.NSApp().activateIgnoringOtherApps_(True)
-        alert.runModal()
+    def _advise(self, slot: str, message: str, informative: str) -> None:
+        """Say one thing to the user, in a **non-modal panel**.
+
+        🔴 **This was `_alert`, and it was `NSAlert.runModal()` plus
+        `activateIgnoringOtherApps_(True)` until Phase 5.** Both calls
+        were wrong here, for reasons this app has measured rather than
+        assumed:
+
+        * `runModal()` spins the run loop in `NSModalPanelRunLoopMode`,
+          where the default-mode timer that stamps `ui_heartbeat_at`
+          fires **zero** times. MEASURED on macOS 26.6.2, 2026-09-10:
+          opening this app's About box froze that stamp **byte-identical
+          across ten seconds, 51.2 seconds end to end**. A modal run loop
+          also never *fetches* a Quit Apple Event, which is the whole of
+          "Quit did nothing, Force Quit worked".
+        * `activateIgnoringOtherApps_` is reported to fail intermittently
+          on macOS 26 (DevForums 807805 / FB21087054). When it does, the
+          modal this app has no window to fall back on opens **behind
+          everything** — invisible, unanswerable, and holding the run
+          loop forever. That is the shape of 2026-09-08.
+
+        This method is renamed rather than rewritten in place so that
+        `_alert` means what it says everywhere in this package: a real
+        modal alert, of which this file now has none.
+
+        **It returns immediately.** Every caller here is a site where the
+        alert was the last statement before a `return` and nothing read a
+        result, so the flow is unchanged; a new caller must check its
+        own.
+
+        🔵 **The anti-stacking rule used to live here, on an ivar, and
+        moved down to `notice_window._SLOTS`.** A modal blocked a second
+        click and a panel does not, so this file grew a "same words,
+        re-show; different words, replace" rule — and then
+        `calibrate_window` needed the identical rule and **structurally
+        could not hold an ivar**: it shows its advisory, returns False,
+        and its caller drops it. Two implementations of one question is
+        how this app once told a user its picture source was empty while
+        fifty pictures rotated on the glass. There is one, and both sites
+        name a slot.
+        """
+        notice_window.advise(message, informative, slot=slot)
 
 
 def main() -> int:
@@ -938,22 +1033,36 @@ def main() -> int:
     respawn a clean exit, so the loser stays down instead of
     respawn-looping against the winner.
 
-    **Exiting silently is a deliberate, and imperfect, choice.** Nothing
-    visible happens when the user double-clicks an already-running
-    ImageView — no bounce, no window, no error. The status item *is*
-    already there, so the honest fix is not an alert (which would be
-    noise for what is a no-op) but for the second instance to flash or
-    highlight the existing status item before exiting. That needs a
-    channel between the two UI processes, which does not exist yet — the
-    command/status files are the UI-to-display channel and giving them
-    UI-to-UI traffic would blur the separation. Recorded as a known
-    rough edge in `ui/README.md` rather than papered over.
+    🔵 **Rewritten 2026-09-10 — this docstring described the opposite of
+    what the function now does.** It said "nothing visible happens when
+    the user double-clicks an already-running ImageView", that "the honest
+    fix is not an alert", that a fix "needs a channel between the two UI
+    processes, which does not exist yet", and that nothing visible to the
+    user had changed — while pointing at a rough-edge section of
+    `ui/README.md` that the same change deleted. Every sentence was true
+    when it was written and false by the time anyone read it. Nothing can
+    fail on a docstring, which is exactly why it is worth saying: **when a
+    phase changes what a code path is, grep the prose describing what it
+    used to be.**
 
-    What *has* changed is that the exit is no longer silent to anyone
-    reading afterwards: the stderr redirect is taken before the guard
-    runs, so the reason survives the process even on a Finder launch,
-    where until now it went to a stderr that macOS discards. Nothing
-    visible to the user has changed. See `display/diagnostics.py`.
+    **A contended launch is no longer silent, and needed no channel.** The
+    arriving instance asks the window server what the holder has on
+    screen, reads its heartbeat and probes its state directory — all from
+    outside, with no cooperation from the holder and no TCC grant — and
+    then shows a non-modal `NSPanel` placed directly under the holder's
+    menu bar icon saying which of eight situations it found.
+    `ui/contention.py` gathers, `ui/contention_state.py` decides,
+    `ui/notice_window.py` draws.
+
+    **A LaunchAgent respawn still shows nothing**, deliberately: it is
+    routine housekeeping, and a window at every login would be the noise
+    the old docstring was right to be wary of. Only a human launch gets a
+    response.
+
+    The exit also survives the process: the stderr redirect is taken
+    before the guard runs, so the reason reaches a log even on a Finder
+    launch, where it used to go to a stderr macOS discards. See
+    `display/diagnostics.py`.
     """
     # Before the guard, deliberately: the guard's decision is the first
     # thing worth recording, and until this runs a Finder-launched menu
@@ -965,36 +1074,93 @@ def main() -> int:
         diagnostics.note(f"menubar: stderr redirected to {stderr_log}.")
 
     ui_lock = paths.ui_lock_path()
-    if single_instance.acquire(ui_lock, "menu bar process") is None:
-        # `read_holder_pid` was documentation-only until now and stays
-        # so: this is still only a message, and a pid can be stale or
-        # reused. Making it load-bearing is Phase 3's job and needs the
-        # executable-path check that goes with it.
-        holder = single_instance.read_holder_pid(ui_lock)
-        holder_text = f"pid {holder}" if holder is not None else "an unknown pid"
-        advice = (
-            f"`kill -USR1 {holder}` dumps its stacks before you kill it"
-            if holder is not None
-            else "the lock file names no pid, so start from `pgrep -fl ImageView`"
-        )
-        # Interpolates strs and a Path only, so the f-string itself
-        # cannot raise — `note()` cannot protect a caller's formatting.
+    guard = single_instance.acquire(ui_lock, "menu bar process")
+    if guard.contended:
+        # `read_holder_pid` was documentation-only until now. It is load
+        # bearing from here: `contention.report()` takes the pid it
+        # returns, verifies it by executable path, looks at what the
+        # window server says that process has on screen, probes
+        # `state/` for writability itself, and reads the heartbeat at a
+        # threshold of its own — then says which of seven things it
+        # found. It never kills, quits or takes over; the one signal it
+        # can send is SIGUSR1, behind a precondition, because an About
+        # box was measured freezing this app's heartbeat for 51.2s and
+        # a stale stamp is therefore a superset of "wedged".
+        #
+        # It never raises, so nothing here can turn a correct silent
+        # exit into a traceback and a non-zero exit code — which
+        # `KeepAlive {SuccessfulExit: false}` would respawn.
+        #
+        # Phase 4b puts the `Notice` on screen, in a non-modal `NSPanel`
+        # placed directly under the holder's menu bar icon. It renders
+        # what `observe()` decided and decides nothing itself — and it
+        # makes none of `runModal()`, `activateIgnoringOtherApps_` or
+        # `statusItemWithLength_`, because the process arriving to
+        # diagnose a wedge must not make the call it is diagnosing.
+        #
+        # `show()` blocks until the user dismisses the window (or, for the
+        # one benign "already running, here is your icon" verdict, until
+        # it dismisses itself). That is deliberate: this process holds no
+        # lock — losing it is why it is here — so waiting costs nothing,
+        # and an instruction that vanishes before it is read is worse than
+        # silence. An agent respawn gets `notice is None` and never waits.
+        #
+        # 🔴 Wrapped even though `observe()` and `show()` are both
+        # documented never to raise, and the belt is not redundant: the
+        # **arguments** are evaluated
+        # out here, and `paths.lock_path()` / `ui_status_path()` /
+        # `state_dir()` all go through `Path.home()`, which raises
+        # `RuntimeError` when a home directory cannot be resolved. That
+        # is the same hazard `pollTick_` names one level down, and here
+        # it would cost a non-zero exit and the respawn loop.
+        try:
+            found = contention.observe(
+                ui_lock,
+                paths.lock_path(),
+                paths.ui_status_path(),
+                paths.state_dir(),
+                paths.UI_AGENT_LABEL,
+            )
+            if found.notice is not None:
+                notice_window.show(found.notice, found.icons, found.avoid)
+        except Exception:
+            print(
+                f"menubar: the contention report itself failed; exiting 0 "
+                f"anyway:\n{traceback.format_exc()}",
+                file=sys.stderr,
+            )
         diagnostics.note(
-            f"menubar: exiting 0 deliberately — {holder_text} already holds "
-            f"{ui_lock}, so the status item is already in the menu bar. If it "
-            f"is NOT, that process is wedged while holding the lock: {advice}."
+            f"menubar: exiting 0 deliberately — another menu bar holds "
+            f"{ui_lock}. A clean exit is not respawned by "
+            f"KeepAlive{{SuccessfulExit: false}}."
         )
         return 0
 
-    # Only now, after `acquire()` returned a handle, is this process
-    # entitled to rotate `ui.stacks.log` — and arming rotates it. See the
-    # rotation rule in `diagnostics.py`. Note what this does and does not
-    # establish: `acquire()` also returns a handle from its `_no_guard()`
+    if guard.unguarded:
+        # Said plainly, which is the whole point of `acquire()` growing a
+        # third outcome. Until it did, this state was indistinguishable
+        # from a clean start and the line below could not be written —
+        # `main()` could only describe the gap in a comment.
+        diagnostics.note(
+            f"menubar: running WITHOUT the single-instance guard — {ui_lock} "
+            f"could not be created. A second menu bar is not excluded, and "
+            f"ui.stacks.log will not be rotated on this launch."
+        )
+
+    # Only now, holding the lock, is this process entitled to rotate
+    # `ui.stacks.log` — and arming rotates it. See the rotation rule in
+    # `diagnostics.py`.
+    #
+    # 🔵 The gap that rule used to name is closed rather than accepted.
+    # `acquire()` also returns a usable result from its `_no_guard()`
     # sentinel, when the lock file could not be created at all, and no
-    # caller can tell the two apart. Under that sentinel the sole-writer
-    # property degrades along with the guard itself — accepted here, and
-    # named in `diagnostics.py` rather than left as an implication.
-    stacks_log = diagnostics.arm_stack_dumps(paths.UI_ROLE)
+    # caller could previously tell the two apart — so a second unguarded
+    # instance would zero a running instance's accumulated dumps.
+    # `sole_writer=guard.acquired` arms without rotating in exactly that
+    # case.
+    stacks_log = diagnostics.arm_stack_dumps(
+        paths.UI_ROLE, sole_writer=guard.acquired
+    )
     if stacks_log is not None:
         diagnostics.note(
             f"menubar: kill -USR1 {os.getpid()} dumps all thread stacks "

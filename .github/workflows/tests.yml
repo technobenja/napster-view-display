@@ -19,9 +19,18 @@
 #     checker can report "wallpaper, not the app" purely because the
 #     calling process lacks Screen Recording, so even locally that is not
 #     the last word — a human looking at the glass is.
+#   * A CI runner has no window server. `launchctl managername` reports
+#     `Background`, not `Aqua`, so every test that asks
+#     CGWindowListCopyWindowInfo what a process has on screen SKIPS here.
+#     Those tests carry a loud skip reason saying so. A green badge has
+#     NOT covered them, and they are what tells "an ImageView window is
+#     open behind something, bring it forward" from "this process is not
+#     responding" — i.e. the difference between an instruction and an
+#     accusation. Run the suite in a graphical session before believing
+#     that half is exercised.
 #
 # Releasing is `packaging/make_release.sh` on a maintainer's Mac, which
-# runs this same suite as its first gate plus six more.
+# runs this same suite as its first gate plus seven more.
 #
 # macOS is not a preference. 30 modules under test import AppKit and
 # pyobjc has no Linux build, so a Linux runner cannot even install the

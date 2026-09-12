@@ -27,10 +27,31 @@ lock is released when the file descriptor closes, and letting it be
 garbage-collected would silently drop the lock. `acquire()` keeps its own
 module-level reference for exactly that reason, so callers cannot get it
 wrong by accident.
+
+**`acquire()` reports three outcomes, not two, and the third is the one
+this module used to hide.** `Acquired` and `Contended` were always
+distinguishable; `Unguarded` — the lock file could not be created at all,
+so this process is running with no guard — was returned as an unlocked
+handle indistinguishable from success, because `is None` was the whole
+contract. `_no_guard()`'s *behaviour* is unchanged and deliberately so
+(refusing to start because a *lock file* could not be created still
+inverts this project's failure philosophy). What changed is that callers
+can no longer be unable to tell, which buys two things that were
+previously impossible to write: a log line naming the unguarded state
+plainly, and a `diagnostics.arm_stack_dumps(..., sole_writer=False)` that
+declines to rotate a log this process has not proven it owns.
+
+🔴 **`acquire()` never returns `None` any more.** The old idiom
+`if acquire(...) is None:` is now silently false, which would let a
+second instance proceed past the guard — the exact failure the guard
+exists to prevent. Every call site reads `.contended` / `.acquired` /
+`.unguarded`, and `AcquisitionTests` pins that `None` is never returned.
 """
 
 from __future__ import annotations
 
+import dataclasses
+import enum
 import fcntl
 import os
 import sys
@@ -50,7 +71,12 @@ def read_holder_pid(path: Path) -> int | None:
     output only. Returns None if unreadable or not a plain integer —
     never raises, and never used for anything but a message."""
     try:
-        text = path.read_text().strip()
+        # `errors="replace"` because `UnicodeDecodeError` is a
+        # `ValueError`, not an `OSError` — so a lock file with one bad
+        # byte raised straight through this handler, out of a function
+        # whose docstring says it never raises, and onto the launch path
+        # that now reads it for more than a message.
+        text = path.read_text(encoding="utf-8", errors="replace").strip()
     except OSError:
         return None
     try:
@@ -59,7 +85,54 @@ def read_holder_pid(path: Path) -> int | None:
         return None
 
 
-def acquire(path: Path, description: str = "display process") -> IO[str] | None:
+class Outcome(enum.Enum):
+    """What `acquire()` actually did. Three values, because there are
+    three things that can happen and the third used to be invisible."""
+
+    #: The exclusive lock is held by this process for its lifetime.
+    ACQUIRED = "acquired"
+    #: Another process holds it. The caller exits **0** — see the module
+    #: docstring for why the exit code is load-bearing.
+    CONTENDED = "contended"
+    #: The lock file could not be created or opened, so nothing is
+    #: guarding anything. The caller proceeds anyway, deliberately.
+    UNGUARDED = "unguarded"
+
+
+@dataclasses.dataclass(frozen=True)
+class Acquisition:
+    """`acquire()`'s answer.
+
+    Deliberately **no `__bool__`**. An implicit truth value on a
+    three-state result is precisely the ambiguity this type exists to
+    remove: `if guard:` would have to pick one of two readings for
+    `UNGUARDED` and would be wrong for half its callers either way. Ask
+    the question you mean.
+
+    `handle` is the open, locked file object for `ACQUIRED`, the
+    `os.devnull` sentinel for `UNGUARDED`, and `None` for `CONTENDED`. It
+    is retained module-side regardless; callers should not need it, and
+    it is exposed only so that a caller can hold a second reference if it
+    ever wants to.
+    """
+
+    outcome: Outcome
+    handle: IO[str] | None = None
+
+    @property
+    def acquired(self) -> bool:
+        return self.outcome is Outcome.ACQUIRED
+
+    @property
+    def contended(self) -> bool:
+        return self.outcome is Outcome.CONTENDED
+
+    @property
+    def unguarded(self) -> bool:
+        return self.outcome is Outcome.UNGUARDED
+
+
+def acquire(path: Path, description: str = "display process") -> Acquisition:
     """Take the exclusive, non-blocking lock on `path`.
 
     `description` names the role in the contention message only. It
@@ -69,16 +142,17 @@ def acquire(path: Path, description: str = "display process") -> IO[str] | None:
     display process" when what actually happened was a second menu bar
     would send the next reader looking at the wrong process entirely.
 
-    Returns the open file object on success (also retained internally),
-    or None if another process holds it — in which case the caller should
-    exit **0**.
+    Returns an `Acquisition`, **never `None`**. On `CONTENDED` the caller
+    should exit **0**.
 
     A lock file that cannot be opened at all (unwritable home, read-only
-    volume) is treated as "no contention" and returns a sentinel-free
-    success: refusing to start the display because a *lock file* could
-    not be created would turn a cosmetic problem into a total outage,
-    which inverts this project's standing failure philosophy (degrade toward "keep showing the last good frame", never toward not
-    running at all). This is logged loudly.
+    volume) is `UNGUARDED`, not a refusal to start: declining to run the
+    display because a *lock file* could not be created would turn a
+    cosmetic problem into a total outage, which inverts this project's
+    standing failure philosophy (degrade toward "keep showing the last
+    good frame", never toward not running at all). That behaviour is
+    unchanged — only its *visibility* to the caller is new. It is still
+    logged loudly here as well.
     """
     global _held
 
@@ -115,7 +189,7 @@ def acquire(path: Path, description: str = "display process") -> IO[str] | None:
             file=sys.stderr,
         )
         handle.close()
-        return None
+        return Acquisition(Outcome.CONTENDED)
 
     try:
         handle.seek(0)
@@ -132,21 +206,33 @@ def acquire(path: Path, description: str = "display process") -> IO[str] | None:
         )
 
     _held = handle
-    return handle
+    return Acquisition(Outcome.ACQUIRED, handle)
 
 
-def _no_guard() -> IO[str]:
+def _no_guard() -> Acquisition:
     """Sentinel for "could not lock, proceeding anyway".
 
-    Returning a real (unlocked) object rather than None keeps the
-    caller's contract simple: None means, and only means, "another
-    instance is running — exit 0". Uses os.devnull so nothing downstream
-    can write through it by accident.
+    **Behaviour preserved where it matters, and improved in one place.**
+    This still opens `os.devnull`, still retains it module-side, and
+    still lets the caller proceed; the label on the way out is new. Uses
+    os.devnull so nothing downstream can write through it by accident.
+
+    The one change is the `try` around that open, and calling it
+    "preserved exactly" would have been wrong: previously an unopenable
+    `/dev/null` raised out of `acquire()`, which means a traceback, a
+    **non-zero exit**, and the respawn loop `KeepAlive
+    {SuccessfulExit: false}` turns that into — from the function whose
+    whole job is to prevent exactly that. At that point the machine has
+    bigger problems than this app, and the answer is still "run anyway",
+    now with no handle at all.
     """
     global _held
-    handle = open(os.devnull, "a+")
+    try:
+        handle: IO[str] | None = open(os.devnull, "a+")
+    except OSError:
+        handle = None
     _held = handle
-    return handle
+    return Acquisition(Outcome.UNGUARDED, handle)
 
 
 def release() -> None:

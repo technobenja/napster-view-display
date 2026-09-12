@@ -37,9 +37,13 @@ class LabelValidationTests(unittest.TestCase):
         self.assertEqual(paths.UI_AGENT_LABEL, f"{paths.BUNDLE_ID}.ui")
 
     def test_the_shipped_label_carries_no_personal_identity(self) -> None:
-        """`com\\.remy\\.` is on the HARD grep list, and this label
-        lands in every user's ~/Library/LaunchAgents/."""
-        self.assertNotIn("remy", paths.UI_AGENT_LABEL.lower())
+        """This label lands in every user's ~/Library/LaunchAgents/.
+
+        Derived from the settled bundle id rather than asserted against
+        a named handle: naming one to exclude it would publish it here,
+        which is what the check is for."""
+        self.assertTrue(paths.UI_AGENT_LABEL.startswith(f"{paths.BUNDLE_ID}."))
+        self.assertFalse(paths.UI_AGENT_LABEL.startswith("com."))
 
     def test_path_separators_are_rejected(self) -> None:
         with self.assertRaises(ui_agent.LabelError):

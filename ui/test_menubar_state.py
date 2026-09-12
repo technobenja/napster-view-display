@@ -745,8 +745,176 @@ class TestRoundTripThroughControl(unittest.TestCase):
                 self.assertFalse(set(out) - control.ALLOWED_KEYS)
 
 
-if __name__ == "__main__":
-    unittest.main()
+class UiStatusRecordTests(unittest.TestCase):
+    """The four process fields, and the types they must refuse.
+
+    `read_ui_status` parses a document written by *some* version of this
+    app — possibly an older one, possibly a newer one, possibly one a
+    user edited by hand. The fields drive a message that names a pid to
+    force quit and a decision about whether to send a signal whose
+    default disposition is terminate, so a hostile value must degrade to
+    "the document did not say", never to a plausible-looking number.
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.path = Path(self._tmp.name) / "ui_status.json"
+
+    def write(self, document: object) -> ms.UiStatus:
+        self.path.write_text(json.dumps(document))
+        return ms.read_ui_status(self.path)
+
+    def test_the_full_record_round_trips(self) -> None:
+        ms.write_ui_heartbeat(
+            self.path,
+            1000.0,
+            pid=4242,
+            exe="/Applications/ImageView.app/Contents/MacOS/ImageView",
+            stacks_armed=True,
+            stacks_path="/logs/ui.stacks.log",
+        )
+        got = ms.read_ui_status(self.path)
+        self.assertEqual(got.heartbeat_at, 1000.0)
+        self.assertEqual(got.pid, 4242)
+        self.assertEqual(got.exe, "/Applications/ImageView.app/Contents/MacOS/ImageView")
+        self.assertTrue(got.stacks_armed)
+        self.assertEqual(got.stacks_path, "/logs/ui.stacks.log")
+        self.assertTrue(got.present)
+
+    def test_a_v115_document_reads_with_defaults(self) -> None:
+        """Backwards: a stamp-only file is what every v1.1.5 menu bar
+        wrote, and it must not read as an impostor or as armed."""
+        got = self.write({"ui_heartbeat_at": 7.0})
+        self.assertEqual(got.heartbeat_at, 7.0)
+        self.assertIsNone(got.pid)
+        self.assertIsNone(got.exe)
+        self.assertFalse(got.stacks_armed)
+        self.assertIsNone(got.stacks_path)
+        self.assertTrue(got.present)
+
+    def test_unknown_keys_are_ignored_rather_than_rejected(self) -> None:
+        """Forwards: a newer version may add fields this reader has never
+        heard of, and the stamp must still be readable."""
+        got = self.write({"ui_heartbeat_at": 7.0, "something_new": {"a": 1}})
+        self.assertEqual(got.heartbeat_at, 7.0)
+        self.assertTrue(got.present)
+
+    def test_a_boolean_pid_is_not_pid_one(self) -> None:
+        """🔴 Caught by mutation. `True` is an `int` subclass in Python,
+        so a bare `int(...)` turns `{"pid": true}` into **pid 1** — and
+        pid 1 is `launchd`. A message naming it, or a signal sent to it,
+        is the worst possible outcome of a hostile value in a state
+        file."""
+        self.assertIsNone(self.write({"ui_heartbeat_at": 1.0, "pid": True}).pid)
+        self.assertIsNone(self.write({"ui_heartbeat_at": 1.0, "pid": False}).pid)
+
+    def test_a_string_pid_is_refused_rather_than_raising(self) -> None:
+        self.assertIsNone(self.write({"ui_heartbeat_at": 1.0, "pid": "7"}).pid)
+        self.assertIsNone(self.write({"ui_heartbeat_at": 1.0, "pid": "seven"}).pid)
+
+    def test_a_nonpositive_pid_is_refused(self) -> None:
+        """0 and negatives are `kill(2)`'s process-*group* selectors: 0
+        is "every process in my group", -1 is "every process I may
+        signal". Neither is a pid, and neither may travel onwards."""
+        for value in (0, -1, -4242):
+            with self.subTest(value=value):
+                self.assertIsNone(self.write({"ui_heartbeat_at": 1.0, "pid": value}).pid)
+
+    def test_a_container_pid_is_refused(self) -> None:
+        for value in ([7], {"pid": 7}, None):
+            with self.subTest(value=value):
+                self.assertIsNone(self.write({"ui_heartbeat_at": 1.0, "pid": value}).pid)
+
+    def test_a_hostile_stacks_armed_is_not_true(self) -> None:
+        """The field that decides whether SIGUSR1 is a read or a kill.
+        Anything that is not a real `true` must read as False."""
+        for value in ("true", 1, "yes", [1], None):
+            with self.subTest(value=value):
+                got = self.write({"ui_heartbeat_at": 1.0, "stacks_armed": value})
+                self.assertFalse(got.stacks_armed)
+
+    def test_a_hostile_exe_or_path_is_refused(self) -> None:
+        got = self.write({"ui_heartbeat_at": 1.0, "exe": 7, "stacks_path": ["/a"]})
+        self.assertIsNone(got.exe)
+        self.assertIsNone(got.stacks_path)
+
+    def test_an_absent_file_is_not_present(self) -> None:
+        got = ms.read_ui_status(self.path.parent / "nope.json")
+        self.assertFalse(got.present)
+        self.assertEqual(got.heartbeat_at, 0.0)
+
+    def test_a_non_object_document_is_not_present(self) -> None:
+        self.assertFalse(self.write([1, 2, 3]).present)
+        self.assertFalse(self.write("hello").present)
+
+    def test_read_ui_status_never_raises(self) -> None:
+        """🔴 The contract, tested rather than read.
+
+        Both readers say **never raises** in bold, and both did: on
+        invalid UTF-8 (`UnicodeDecodeError` is a `ValueError`, not an
+        `OSError`, so it went straight through the handler written to
+        make them total) and on a non-finite JSON number reaching
+        `int()`. A table of hostile files is cheap and would have caught
+        both. Test the contract, not the docstring.
+        """
+        cases: list[tuple[str, object]] = [
+            ("absent", None),
+            ("empty", b""),
+            ("invalid utf-8", b'{"ui_heartbeat_at": 1.0, "exe": "\xff\xfe"}'),
+            ("a lone continuation byte", b"\x80"),
+            ("truncated mid-write", b'{"ui_heartbeat_at": 12'),
+            ("not an object", b"[1, 2, 3]"),
+            ("not json at all", b"\x00\x01\x02binary"),
+            ("NaN pid", b'{"pid": NaN}'),
+            ("infinite pid", b'{"pid": 1e400}'),
+            ("negative infinite pid", b'{"pid": -1e400}'),
+            ("NaN stamp", b'{"ui_heartbeat_at": NaN}'),
+            ("infinite stamp", b'{"ui_heartbeat_at": 1e400}'),
+            ("boolean everywhere", b'{"pid": true, "stacks_armed": 1, "exe": 7}'),
+            ("deeply nested", b'{"pid": ' + b"[" * 200 + b"]" * 200 + b"}"),
+            ("a large blob", b'{"exe": "' + b"x" * 200_000 + b'"}'),
+        ]
+        for label, payload in cases:
+            with self.subTest(label):
+                target = self.path
+                if payload is None:
+                    target = self.path.parent / "definitely-absent.json"
+                else:
+                    target.write_bytes(payload)
+                got = ms.read_ui_status(target)
+                self.assertIsInstance(got, ms.UiStatus)
+                self.assertIsInstance(ms.read_ui_heartbeat(target), float)
+                # Whatever came back must be safe to act on: a pid is a
+                # positive int or nothing, and nothing else is a pid.
+                self.assertTrue(got.pid is None or got.pid > 0, f"{label}: {got.pid}")
+                self.assertIsInstance(got.stacks_armed, bool)
+
+    def test_read_ui_status_never_raises_on_an_unreadable_path(self) -> None:
+        """A directory where the file should be, and a symlink loop:
+        both are `OSError`, which the existing handler covers — pinned so
+        that widening the decode fix never narrows this."""
+        directory = self.path.parent / "adirectory"
+        directory.mkdir()
+        self.assertFalse(ms.read_ui_status(directory).present)
+
+        loop = self.path.parent / "loop.json"
+        loop.symlink_to(loop)
+        self.assertFalse(ms.read_ui_status(loop).present)
+
+    def test_read_status_never_raises_on_invalid_utf8_either(self) -> None:
+        """`status.json` is written by the other process and read by the
+        menu title on every 0.4s tick. Same helper, same guarantee."""
+        self.path.write_bytes(b'{"heartbeat_at": 1.0, "source_label": "\xff"}')
+        self.assertTrue(ms.read_status(self.path).present)
+
+    def test_read_ui_heartbeat_is_the_records_own_field(self) -> None:
+        """One parser, not two. A second code path answering the same
+        question does not fail loudly when it drifts."""
+        ms.write_ui_heartbeat(self.path, 55.0, pid=9)
+        self.assertEqual(
+            ms.read_ui_heartbeat(self.path), ms.read_ui_status(self.path).heartbeat_at
+        )
 
 
 class AboutTextTests(unittest.TestCase):
@@ -789,3 +957,7 @@ class AboutTextTests(unittest.TestCase):
         _title, body = ms.about_text("1.1.2")
         self.assertIn("Not affiliated", body)
         self.assertIn("trademarks", body)
+
+
+if __name__ == "__main__":
+    unittest.main()
